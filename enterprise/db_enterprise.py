@@ -221,7 +221,7 @@ class Tenant(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    is_personal = Column(Boolean, nullable=False, server_default=text("0"))
+    is_personal = Column(Boolean, nullable=False, server_default=text("true"))
 
 
 class User(Base):
@@ -304,8 +304,7 @@ class TenantLimits(Base):
     daily_requests_limit = Column(Integer, nullable=False)
     rpm_limit = Column(Integer, nullable=False)
     daily_token_limit = Column(Integer, nullable=False, default=DEFAULT_DAILY_TOKEN_LIMIT)
-    enabled = Column(Boolean, nullable=False, default=True, server_default=text("1"))
-
+    enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
 
 class TenantProviderConfig(Base):
     __tablename__ = "tenant_provider_configs"
@@ -358,7 +357,7 @@ class TenantPolicy(Base):
     rule_type = Column(String, nullable=False)
     match = Column(String, nullable=False)
     action = Column(String, nullable=False)
-    enabled = Column(Boolean, nullable=False, default=True, server_default=text("1"))
+    enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -379,8 +378,8 @@ class TenantPolicySettings(Base):
     health_action = Column(String, nullable=False, server_default=text("'redact'"))
     ip_action = Column(String, nullable=False, server_default=text("'redact'"))
     block_threshold = Column(String, nullable=False, server_default=text("'critical'"))
-    store_original_prompt = Column(Boolean, nullable=False, default=True, server_default=text("1"))
-    show_sanitized_prompt_admin = Column(Boolean, nullable=False, default=True, server_default=text("1"))
+    store_original_prompt = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    show_sanitized_prompt_admin = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
