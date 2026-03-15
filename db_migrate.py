@@ -1,6 +1,6 @@
 import os
 from sqlalchemy import text
-from database import engine
+from db import engine
 
 MIGRATIONS_DIR = "migrations"
 MIGRATION_TABLE = "applied_migrations"

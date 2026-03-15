@@ -99,7 +99,7 @@ from tools.web_search import WebSearchError, WEB_SEARCH_TOOL
 
 from fastapi import FastAPI
 from sqlalchemy import text
-from database import engine
+from db import engine
 from db_migrate import run_migrations
 
 app = FastAPI(title="Shadow AI Gateway (MVP + Risk + DB)")
