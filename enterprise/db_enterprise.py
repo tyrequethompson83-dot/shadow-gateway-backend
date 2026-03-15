@@ -493,6 +493,29 @@ def get_default_tenant_id() -> int:
         return int(tenant.id)
 
 
+def create_tenant(name: str, *, is_personal: bool = False) -> int:
+    """Create a tenant and return its id."""
+
+    ensure_enterprise_schema()
+    safe_name = (name or "").strip()
+    if not safe_name:
+        raise ValueError("tenant name is required")
+    with get_session() as session:
+        tenant = Tenant(name=safe_name, is_personal=bool(is_personal))
+        session.add(tenant)
+        session.flush()
+        return int(tenant.id)
+
+
+def list_tenants() -> List[Dict[str, Any]]:
+    """List all tenants."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        rows = session.execute(select(Tenant).order_by(Tenant.id)).scalars().all()
+        return [_model_to_dict(r) for r in rows]
+
+
 # --------------------------------------------------------------------------- #
 # User helpers
 # --------------------------------------------------------------------------- #
@@ -563,12 +586,12 @@ def has_any_admin_membership() -> bool:
         return bool(row)
 
 
-def set_user_password(user_id: int, password: str) -> None:
+def set_user_password(user_id: int, new_password: str) -> Dict[str, Any]:
     """Set a user's password using PBKDF2 hashing (non-legacy)."""
 
     ensure_enterprise_schema()
     user_id_int = int(user_id)
-    hashes = make_password_hash(password)
+    hashes = make_password_hash(new_password)
     with get_session() as session:
         user = session.get(User, user_id_int)
         if not user:
@@ -578,6 +601,52 @@ def set_user_password(user_id: int, password: str) -> None:
         user.locked_until = None
         user.is_active = True
         session.flush()
+        return _model_to_dict(user)
+
+
+def list_users(limit: int = 200) -> List[Dict[str, Any]]:
+    """List users with an optional limit."""
+
+    ensure_enterprise_schema()
+    cap = max(1, min(int(limit), 5000))
+    with get_session() as session:
+        rows = (
+            session.execute(select(User).order_by(User.id).limit(cap))
+            .scalars()
+            .all()
+        )
+        return [_model_to_dict(r) for r in rows]
+
+
+def create_auth_user(username: str, password: str, display_name: Optional[str] = None) -> Dict[str, Any]:
+    """Create a user with hashed password; username also populates external_id/email when applicable."""
+
+    ensure_enterprise_schema()
+    uname = (username or "").strip()
+    if not uname:
+        raise ValueError("username is required")
+
+    with get_session() as session:
+        existing = session.execute(
+            select(User).where(func.lower(User.username) == func.lower(uname))
+        ).scalar_one_or_none()
+        if existing:
+            raise ValueError("user already exists")
+
+        hashes = make_password_hash(password)
+        email_val = uname if "@" in uname else None
+        user = User(
+            external_id=uname,
+            username=uname,
+            display_name=display_name or uname,
+            email=email_val,
+            password_hash=hashes["password_hash"],
+            password_salt=hashes["password_salt"],
+            is_active=True,
+        )
+        session.add(user)
+        session.flush()
+        return _model_to_dict(user)
 
 
 def get_role(tenant_id: int, user_id: Optional[int]) -> str:
@@ -591,6 +660,54 @@ def get_role(tenant_id: int, user_id: Optional[int]) -> str:
             )
         ).scalar_one_or_none()
         return _normalize_role_name(membership or "user")
+
+
+def list_memberships(tenant_id: int) -> List[Dict[str, Any]]:
+    """List memberships for a tenant."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(Membership).where(Membership.tenant_id == int(tenant_id)).order_by(Membership.id)
+            )
+            .scalars()
+            .all()
+        )
+        return [_model_to_dict(r) for r in rows]
+
+
+def upsert_membership(tenant_id: int, user_id: int, role: str) -> Dict[str, Any]:
+    """Create or update a membership."""
+
+    ensure_enterprise_schema()
+    role_name = _normalize_role_name(role)
+    if role_name not in (
+        "platform_admin",
+        "admin",
+        "auditor",
+        "tenant_admin",
+        "user",
+        "employee",
+    ):
+        raise ValueError("invalid role")
+
+    with get_session() as session:
+        existing = session.execute(
+            select(Membership).where(
+                Membership.tenant_id == int(tenant_id),
+                Membership.user_id == int(user_id),
+            )
+        ).scalar_one_or_none()
+        if existing:
+            existing.role = role_name
+            session.flush()
+            return _model_to_dict(existing)
+
+        membership = Membership(tenant_id=int(tenant_id), user_id=int(user_id), role=role_name)
+        session.add(membership)
+        session.flush()
+        return _model_to_dict(membership)
 
 
 # --------------------------------------------------------------------------- #
@@ -905,6 +1022,32 @@ def get_tenant_limits(tenant_id: int) -> Dict[str, Any]:
         return _model_to_dict(limits)
 
 
+def upsert_tenant_limits(
+    tenant_id: int,
+    *,
+    daily_requests_limit: Optional[int] = None,
+    rpm_limit: Optional[int] = None,
+    daily_token_limit: Optional[int] = None,
+    enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Update tenant limits and return the row."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        limits = _ensure_tenant_limits(session, tenant_id)
+        if daily_requests_limit is not None:
+            limits.daily_requests_limit = max(1, int(daily_requests_limit))
+        if rpm_limit is not None:
+            limits.rpm_limit = max(1, int(rpm_limit))
+        if daily_token_limit is not None:
+            limits.daily_token_limit = max(0, int(daily_token_limit))
+        if enabled is not None:
+            limits.enabled = bool(enabled)
+        session.flush()
+        return _model_to_dict(limits)
+
+
 def _ensure_usage_row(session, tenant_id: int, day: str) -> TenantUsageDaily:
     row = session.execute(
         select(TenantUsageDaily).where(
@@ -1060,6 +1203,81 @@ def upsert_tenant_policy_settings(
 
 
 # --------------------------------------------------------------------------- #
+# Policy rules (legacy / admin UI)
+# --------------------------------------------------------------------------- #
+
+def create_policy_rule(
+    *,
+    tenant_id: int,
+    rule_type: str,
+    match: str,
+    action: str,
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    ensure_enterprise_schema()
+    rule_type_norm = str(rule_type or "").strip().lower()
+    if rule_type_norm not in ("injection", "category", "severity"):
+        raise ValueError("rule_type must be injection, category, or severity")
+    action_norm = str(action or "").strip().upper()
+    if action_norm not in ("ALLOW", "REDACT", "BLOCK"):
+        raise ValueError("action must be ALLOW, REDACT, or BLOCK")
+
+    with get_session() as session:
+        rule = TenantPolicy(
+            tenant_id=int(tenant_id),
+            rule_type=rule_type_norm,
+            match=str(match or "").strip(),
+            action=action_norm,
+            enabled=bool(enabled),
+        )
+        session.add(rule)
+        session.flush()
+        return _model_to_dict(rule)
+
+
+def list_policy_rules(tenant_id: int, rule_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    ensure_enterprise_schema()
+    with get_session() as session:
+        query = select(TenantPolicy).where(TenantPolicy.tenant_id == int(tenant_id))
+        if rule_type:
+            query = query.where(TenantPolicy.rule_type == str(rule_type).strip().lower())
+        rows = session.execute(query.order_by(TenantPolicy.id)).scalars().all()
+        return [_model_to_dict(r) for r in rows]
+
+
+def update_policy_rule(
+    rule_id: int,
+    *,
+    match: Optional[str] = None,
+    action: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    ensure_enterprise_schema()
+    with get_session() as session:
+        rule = session.get(TenantPolicy, int(rule_id))
+        if not rule:
+            return None
+        if match is not None:
+            rule.match = str(match).strip()
+        if action is not None:
+            action_norm = str(action or "").strip().upper()
+            if action_norm not in ("ALLOW", "REDACT", "BLOCK"):
+                raise ValueError("action must be ALLOW, REDACT, or BLOCK")
+            rule.action = action_norm
+        if enabled is not None:
+            rule.enabled = bool(enabled)
+        session.flush()
+        return _model_to_dict(rule)
+
+
+def delete_policy_rule(rule_id: int) -> bool:
+    ensure_enterprise_schema()
+    with get_session() as session:
+        result = session.execute(delete(TenantPolicy).where(TenantPolicy.id == int(rule_id)))
+        return int(result.rowcount or 0) > 0
+
+
+# --------------------------------------------------------------------------- #
 # Onboarding bootstrap
 # --------------------------------------------------------------------------- #
 
@@ -1201,9 +1419,126 @@ def write_audit_log(
         return int(log.id)
 
 
+def list_audit_logs(tenant_id: int, *, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    """List audit logs for a tenant (newest first)."""
+
+    ensure_enterprise_schema()
+    cap = max(1, min(int(limit), 5000))
+    off = max(0, int(offset))
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(AuditLog)
+                .where(AuditLog.tenant_id == int(tenant_id))
+                .order_by(AuditLog.id.desc())
+                .offset(off)
+                .limit(cap)
+            )
+            .scalars()
+            .all()
+        )
+        return [_model_to_dict(r) for r in rows]
+
+
+def verify_audit_chain(tenant_id: int, *, limit: int = 500) -> Dict[str, Any]:
+    """Verify hash chain integrity for recent audit logs."""
+
+    ensure_enterprise_schema()
+    cap = max(1, min(int(limit), 2000))
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(AuditLog)
+                .where(AuditLog.tenant_id == int(tenant_id))
+                .order_by(AuditLog.id)
+                .limit(cap)
+            )
+            .scalars()
+            .all()
+        )
+
+    prev_hash_by_chain: Dict[str, str] = {}
+    failures: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = {
+            "action": row.action,
+            "target_type": row.target_type,
+            "target_id": row.target_id,
+            "metadata": json.loads(row.metadata_json or "{}") if row.metadata_json else {},
+            "ip": row.ip,
+            "user_agent": row.user_agent,
+            "request_id": row.request_id,
+        }
+        chain = row.chain_id or row.request_id or ""
+        prev = prev_hash_by_chain.get(chain, "") if chain else ""
+        expected = compute_row_hash(payload, prev, os.getenv("AUDIT_SIGNING_KEY", DEFAULT_AUDIT_SIGNING_KEY))
+        if expected != (row.row_hash or ""):
+            failures.append(
+                {
+                    "id": int(row.id),
+                    "chain_id": chain,
+                    "stored_hash": row.row_hash,
+                    "expected_hash": expected,
+                    "prev_hash": prev,
+                }
+            )
+        prev_hash_by_chain[chain] = row.row_hash or ""
+
+    return {"ok": len(failures) == 0, "checked": len(rows), "failures": failures}
+
+
 # --------------------------------------------------------------------------- #
 # Jobs
 # --------------------------------------------------------------------------- #
+
+def create_job(
+    *,
+    tenant_id: int,
+    job_type: str,
+    input_json: Optional[str] = None,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a queued job."""
+
+    ensure_enterprise_schema()
+    job_id = str(uuid.uuid4())
+    with get_session() as session:
+        job = Job(
+            id=job_id,
+            tenant_id=int(tenant_id),
+            user_id=int(user_id) if user_id is not None else None,
+            type=str(job_type),
+            status="queued",
+            input_json=input_json,
+        )
+        session.add(job)
+        session.flush()
+        return _model_to_dict(job)
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a job by id."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        job = session.get(Job, str(job_id))
+        return _model_to_dict(job) if job else None
+
+
+def list_jobs(tenant_id: Optional[int] = None, status: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    """List jobs with optional filters."""
+
+    ensure_enterprise_schema()
+    cap = max(1, min(int(limit), 1000))
+    with get_session() as session:
+        query = select(Job)
+        if tenant_id is not None:
+            query = query.where(Job.tenant_id == int(tenant_id))
+        if status:
+            query = query.where(Job.status == str(status))
+        rows = session.execute(query.order_by(Job.created_at.desc()).limit(cap)).scalars().all()
+        return [_model_to_dict(r) for r in rows]
+
 
 def claim_next_job(job_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Atomically claim the oldest queued job (skip locked on Postgres)."""
