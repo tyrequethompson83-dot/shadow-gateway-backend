@@ -62,9 +62,20 @@ def _normalize_email(value: str) -> str:
     return email
 
 
-def _table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return [str(r[1]) for r in rows]
+from sqlalchemy import inspect
+from sqlalchemy.engine import Connection
+from typing import List
+
+def _table_columns(conn: Connection, table_name: str) -> List[str]:
+    """Get columns of a table without using PRAGMA, compatible with SQLite and Postgres."""
+    inspector = inspect(conn)
+
+    # Ensure table exists
+    if table_name not in inspector.get_table_names():
+        return []
+
+    # Return column names
+    return [col["name"] for col in inspector.get_columns(table_name)]
 
 
 def _normalize_role_name(role: str) -> str:
