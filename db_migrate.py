@@ -42,9 +42,14 @@ def run_migrations():
             with open(path, "r", encoding="utf-8") as f:
                 sql = f.read()
 
-            # Remove SQLite PRAGMA lines if using Postgres
-            if engine.dialect.name != "sqlite":
-                lines = [line for line in sql.splitlines() if "PRAGMA" not in line.upper()]
+                # Remove SQLite PRAGMA lines if using Postgres
+                if engine.dialect.name == "postgresql":
+                    # remove all SQLite PRAGMA lines for Postgres
+                    lines = [line for line in sql.splitlines() if not line.strip().upper().startswith("PRAGMA")]
+                else:
+                    # keep PRAGMA lines for SQLite/dev
+                    lines = sql.splitlines()
+
                 sql = "\n".join(lines)
 
             # Skip empty files
