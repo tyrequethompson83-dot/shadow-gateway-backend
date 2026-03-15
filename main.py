@@ -121,7 +121,7 @@ def _dev_safe_cors_origins() -> List[str]:
 # Keep CORS as the outermost middleware so preflight OPTIONS is handled before auth/rate-limit middleware.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_dev_safe_cors_origins(),
+    allow_origins=["https://shadow-gateway-frontend.pages.dev", "https://app.shadowaigateway.com"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Tenant-Id", "X-User", "X-Request-Id"],
