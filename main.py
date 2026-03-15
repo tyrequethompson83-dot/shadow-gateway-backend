@@ -97,12 +97,16 @@ from tenant_llm import build_tenant_provider, provider_health_snapshot
 from tools.tool_router import execute_tool_call
 from tools.web_search import WebSearchError, WEB_SEARCH_TOOL
 
-app = FastAPI(title="Shadow AI Gateway (MVP + Risk + DB)")
+from fastapi import FastAPI
 from sqlalchemy import text
 from database import engine
+from db_migrate import run_migrations
+
+app = FastAPI(title="Shadow AI Gateway (MVP + Risk + DB)")
 
 @app.on_event("startup")
-def fix_database_schema():
+def ensure_schema_and_run_migrations():
+    # quick patch for tenants.is_personal
     try:
         with engine.begin() as conn:
             conn.execute(text("""
@@ -112,7 +116,13 @@ def fix_database_schema():
         print("tenants.is_personal ensured")
     except Exception as e:
         print(f"Schema patch skipped: {e}")
-        
+
+    # run full migrations folder
+    try:
+        run_migrations()
+    except Exception as e:
+        print(f"Migration runner failed: {e}")
+
 # Enterprise middleware (non-breaking defaults)
 app.add_middleware(TenantLimitsMiddleware)
 app.add_middleware(EnterpriseContextMiddleware)
