@@ -1,0 +1,12 @@
+ALTER TABLE tenants
+ADD COLUMN is_personal BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE tenant_limits
+ALTER COLUMN enabled SET DEFAULT TRUE;
+
+ALTER TABLE tenant_policies
+ALTER COLUMN enabled SET DEFAULT TRUE;
+
+ALTER TABLE tenant_policy_settings
+ALTER COLUMN store_original_prompt SET DEFAULT TRUE,
+ALTER COLUMN show_sanitized_prompt_admin SET DEFAULT TRUE;
