@@ -125,6 +125,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Tenant-Id", "X-User", "X-Request-Id"],
+    # Force Access-Control-Allow-Origin for production frontend
+@app.middleware("http")
+async def force_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    # Always allow your production frontend origin
+    response.headers["Access-Control-Allow-Origin"] = "https://app.shadowaigateway.com"
+    return response
 )
 app.include_router(admin_router)
 
