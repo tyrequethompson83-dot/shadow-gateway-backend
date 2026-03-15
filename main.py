@@ -117,6 +117,19 @@ def _dev_safe_cors_origins() -> List[str]:
                 origins.append(origin)
     return origins
 
+from starlette.requests import Request
+from starlette.responses import Response
+
+# ← Catch unhandled exceptions so CORS still applies on 500s
+async def catch_exceptions_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        print(f"Unhandled exception: {exc}")  # logs real error in Railway
+        return Response("Internal Server Error", status_code=500)
+
+# Add exception catcher first
+app.middleware("http")(catch_exceptions_middleware)
 
 # ← THIS MUST BE THE FIRST middleware added
 app.add_middleware(
