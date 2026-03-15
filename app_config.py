@@ -7,8 +7,10 @@ APP_ENV_PROD = "prod"
 DEFAULT_DEV_STREAMLIT_ORIGIN = "http://127.0.0.1:8501"
 DEFAULT_DEV_NEXT_ORIGIN = "http://127.0.0.1:3000"
 DEFAULT_PROD_FRONTEND_ORIGIN = "https://app.shadowaigateway.com"
+ALT_PROD_FRONTEND_ORIGIN = "https://shadowaigateway.com"
 REQUIRED_CORS_ORIGINS = [
     DEFAULT_PROD_FRONTEND_ORIGIN,
+    ALT_PROD_FRONTEND_ORIGIN,
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
@@ -77,6 +79,7 @@ def cors_allowed_origins() -> List[str]:
     ).strip()
     required_origins = [
         configured_prod_origin,
+        ALT_PROD_FRONTEND_ORIGIN,
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
