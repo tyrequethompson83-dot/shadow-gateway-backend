@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN python -m spacy download en_core_web_sm
+
+COPY . /app
+RUN chmod +x /app/docker/entrypoint_api.sh
+
+ENV PYTHONUNBUFFERED=1
+ENV DB_PATH=/data/app.db
+ENV LOG_DIR=/data/logs
+ENV MIGRATIONS_DIR=/app/migrations
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/docker/entrypoint_api.sh"]

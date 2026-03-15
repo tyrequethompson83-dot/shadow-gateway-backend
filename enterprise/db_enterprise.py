@@ -1,19 +1,43 @@
+"""
+Enterprise database access layer.
+
+Postgres is the primary target (via DATABASE_URL); a local SQLite file is used
+only when DATABASE_URL is absent, mainly for local development. All functions
+return dictionaries to keep the calling code JSON‑friendly.
+"""
+
 import hashlib
 import hmac
 import json
 import os
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-except Exception:
-    psycopg2 = None
-    RealDictCursor = None
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    and_,
+    case,
+    create_engine,
+    func,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from provider_layer import (
     default_base_url_for_provider,
@@ -26,22 +50,23 @@ from security_utils import (
     decrypt_secret,
     encrypt_secret,
     is_encrypted_secret,
-    make_password_hash,
     mask_key_tail,
-    redact_secrets,
-    verify_password,
 )
 
-try:
-    # Reuse the project's DB_PATH if declared in db.py so we operate on the same SQLite file.
-    from db import DB_PATH
-except Exception:
-    DB_PATH = "app.db"
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 
+DB_PATH = os.getenv("DB_PATH", "app.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-
 DEFAULT_AUDIT_SIGNING_KEY = "dev-audit-key-change-me"
+
+DEFAULT_PROVIDER = "gemini"
+ROUTING_PROVIDER_PRIORITY = ("gemini", "openai", "groq", "anthropic")
+KEY_PROVIDER_PRIORITY = ROUTING_PROVIDER_PRIORITY + ("tavily",)
+PLATFORM_ADMIN_ROLE = "platform_admin"
+POLICY_ACTIONS = {"allow", "redact", "block"}
+POLICY_BLOCK_THRESHOLDS = {"high", "critical"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -56,23 +81,62 @@ def _env_int(name: str, default: int) -> int:
 DEFAULT_DAILY_REQUESTS_LIMIT = max(1, _env_int("TENANT_RPD_DEFAULT", 2000))
 DEFAULT_RPM_LIMIT = max(1, _env_int("TENANT_RPM_DEFAULT", 60))
 DEFAULT_DAILY_TOKEN_LIMIT = max(0, _env_int("TENANT_MAX_TOKENS_DEFAULT", 200000))
-DEFAULT_PROVIDER = "gemini"
-ROUTING_PROVIDER_PRIORITY = ("gemini", "openai", "groq", "anthropic")
-KEY_PROVIDER_PRIORITY = ROUTING_PROVIDER_PRIORITY + ("tavily",)
-PLATFORM_ADMIN_ROLE = "platform_admin"
 
-POLICY_ACTIONS = {"allow", "redact", "block"}
-POLICY_BLOCK_THRESHOLDS = {"high", "critical"}
-DEFAULT_TENANT_POLICY_SETTINGS: Dict[str, Any] = {
-    "pii_action": "redact",
-    "financial_action": "redact",
-    "secrets_action": "block",
-    "health_action": "redact",
-    "ip_action": "redact",
-    "block_threshold": "critical",
-    "store_original_prompt": True,
-    "show_sanitized_prompt_admin": True,
-}
+
+def _database_url() -> str:
+    return DATABASE_URL or f"sqlite:///{DB_PATH}"
+
+
+engine: Engine = create_engine(_database_url(), future=True, echo=False)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False,
+    future=True,
+)
+Base = declarative_base()
+
+
+# --------------------------------------------------------------------------- #
+# Utility helpers
+# --------------------------------------------------------------------------- #
+
+def _now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utcnow_iso() -> str:
+    return _now_dt().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def compute_row_hash(payload: Dict[str, Any], prev_hash: str, signing_key: str) -> str:
+    canonical_payload = _canonical_json(payload)
+    message = f"{canonical_payload}|{prev_hash or ''}".encode("utf-8")
+    return hmac.new(signing_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if hasattr(row, "_mapping"):
+        return dict(row._mapping)
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _rows_to_dicts(rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    return [_row_to_dict(r) for r in rows]
 
 
 def _safe_provider_name(provider: Any) -> Optional[str]:
@@ -89,80 +153,6 @@ def _safe_key_provider(provider: Any) -> Optional[str]:
     return None
 
 
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
-
-
-def compute_row_hash(payload: Dict[str, Any], prev_hash: str, signing_key: str) -> str:
-    """
-    Deterministic audit row hash:
-      HMAC_SHA256(signing_key, canonical_payload + "|" + prev_hash)
-    """
-    canonical_payload = _canonical_json(payload)
-    message = f"{canonical_payload}|{prev_hash or ''}".encode("utf-8")
-    return hmac.new(signing_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
-
-
-@contextmanager
-def get_conn():
-    if DATABASE_URL and psycopg2:
-        pg_conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        pg_conn.autocommit = True
-
-        class PGWrapper:
-            def __init__(self, conn):
-                self.conn = conn
-
-            def execute(self, sql: str, params: Any = None):
-                translated = sql.replace("?", "%s")
-                cur = self.conn.cursor()
-                cur.execute(translated, params or [])
-                return cur
-
-            def executemany(self, sql: str, seq):
-                translated = sql.replace("?", "%s")
-                cur = self.conn.cursor()
-                cur.executemany(translated, seq)
-                return cur
-
-            def commit(self):
-                try:
-                    self.conn.commit()
-                except Exception:
-                    pass
-
-            def close(self):
-                try:
-                    self.conn.close()
-                except Exception:
-                    pass
-
-        wrapper = PGWrapper(pg_conn)
-        try:
-            yield wrapper
-        finally:
-            wrapper.commit()
-            wrapper.close()
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA foreign_keys = ON;")
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return [r[1] for r in rows]
-
-
 def _normalize_role_name(role: str) -> str:
     role_name = (role or "").strip()
     if role_name == "admin":
@@ -170,1709 +160,626 @@ def _normalize_role_name(role: str) -> str:
     return role_name
 
 
-def _backfill_provider_keys_from_legacy(conn: sqlite3.Connection) -> None:
-    """
-    Best-effort migration from legacy tenant_provider_configs.api_key into
-    tenant_provider_keys. This preserves current behavior while centralizing
-    key storage per-tenant/per-provider.
-    """
-    tables = {
-        str(r[0])
-        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    }
-    if "tenant_provider_configs" not in tables or "tenant_provider_keys" not in tables:
-        return
+def _dialect_insert(model):
+    return pg_insert(model) if engine.dialect.name == "postgresql" else sqlite_insert(model)
 
-    rows = conn.execute(
-        """
-        SELECT tenant_id, provider, api_key, api_key_tail, created_at, updated_at
-        FROM tenant_provider_configs
-        WHERE COALESCE(api_key, '') != ''
-        """
-    ).fetchall()
-    for row in rows:
-        tenant_id = int(row["tenant_id"])
-        provider = _safe_provider_name(row["provider"])
-        if not provider:
-            continue
-        raw_key = (row["api_key"] or "").strip()
-        if not raw_key:
-            continue
 
-        api_key_enc = raw_key
-        api_key_tail = (row["api_key_tail"] or "").strip() or None
+# --------------------------------------------------------------------------- #
+# Metadata helpers (information_schema first)
+# --------------------------------------------------------------------------- #
 
-        if not is_encrypted_secret(api_key_enc):
-            api_key_tail = mask_key_tail(raw_key)
-            api_key_enc = encrypt_secret(raw_key)
-        elif not api_key_tail:
-            try:
-                api_key_tail = mask_key_tail(decrypt_secret(api_key_enc))
-            except ValueError:
-                api_key_tail = None
-
-        created_at = row["created_at"] or _utcnow_iso()
-        updated_at = row["updated_at"] or _utcnow_iso()
-        conn.execute(
+def table_exists(table_name: str, *, schema: str = "public") -> bool:
+    if engine.dialect.name == "postgresql":
+        query = text(
             """
-            INSERT INTO tenant_provider_keys
-              (tenant_id, provider, api_key_enc, api_key_tail, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id, provider) DO NOTHING
-            """,
-            (tenant_id, provider, api_key_enc, api_key_tail, created_at, updated_at),
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = :schema AND table_name = :table
+            LIMIT 1
+            """
         )
-        conn.execute(
+        with engine.connect() as conn:
+            row = conn.execute(query, {"schema": schema, "table": table_name}).first()
+            return bool(row)
+
+    from sqlalchemy import inspect  # lazy import to avoid unused on Postgres
+
+    inspector = inspect(engine)
+    return table_name in inspector.get_table_names()
+
+
+def list_columns(table_name: str, *, schema: str = "public") -> List[str]:
+    if engine.dialect.name == "postgresql":
+        query = text(
             """
-            UPDATE tenant_provider_configs
-            SET api_key = '', api_key_tail = COALESCE(api_key_tail, ?), updated_at = ?
-            WHERE tenant_id = ? AND provider = ?
-            """,
-            (api_key_tail, _utcnow_iso(), tenant_id, provider),
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = :table
+            ORDER BY ordinal_position
+            """
         )
+        with engine.connect() as conn:
+            return [str(r[0]) for r in conn.execute(query, {"schema": schema, "table": table_name}).all()]
+
+    from sqlalchemy import inspect
+
+    inspector = inspect(engine)
+    if table_name not in inspector.get_table_names():
+        return []
+    return [c["name"] for c in inspector.get_columns(table_name)]
 
 
-def _backfill_audit_chain_if_needed(conn: sqlite3.Connection) -> None:
-    """
-    Backfill chain fields for tenants that still have unchained rows.
-    This runs only when at least one row has missing chain fields.
-    """
-    signing_key = os.getenv("AUDIT_SIGNING_KEY", "").strip() or DEFAULT_AUDIT_SIGNING_KEY
-    tenants = conn.execute(
-        """
-        SELECT DISTINCT tenant_id
-        FROM audit_logs
-        WHERE row_hash IS NULL OR prev_hash IS NULL OR chain_id IS NULL
-        ORDER BY tenant_id ASC
-        """
-    ).fetchall()
-    for tenant_row in tenants:
-        tenant_id = int(tenant_row["tenant_id"])
-        chain_id = f"tenant-{tenant_id}"
-        prev_hash = ""
-        rows = conn.execute(
-            """
-            SELECT id, tenant_id, user_id, action, target_type, target_id, metadata_json,
-                   ip, user_agent, request_id, created_at
-            FROM audit_logs
-            WHERE tenant_id = ?
-            ORDER BY id ASC
-            """,
-            (tenant_id,),
-        ).fetchall()
-        for row in rows:
-            payload = {
-                "tenant_id": int(row["tenant_id"]),
-                "user_id": row["user_id"],
-                "action": row["action"],
-                "target_type": row["target_type"],
-                "target_id": row["target_id"],
-                "metadata_json": row["metadata_json"] or "{}",
-                "ip": row["ip"],
-                "user_agent": row["user_agent"],
-                "request_id": row["request_id"],
-                "created_at": row["created_at"],
-                "chain_id": chain_id,
-            }
-            row_hash = compute_row_hash(payload=payload, prev_hash=prev_hash, signing_key=signing_key)
-            conn.execute(
-                """
-                UPDATE audit_logs
-                SET prev_hash = ?, row_hash = ?, chain_id = ?
-                WHERE id = ?
-                """,
-                (prev_hash, row_hash, chain_id, int(row["id"])),
-            )
-            prev_hash = row_hash
+# --------------------------------------------------------------------------- #
+# ORM models
+# --------------------------------------------------------------------------- #
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    is_personal = Column(Boolean, nullable=False, server_default=text("0"))
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_id = Column(String, unique=True)
+    username = Column(String, unique=True)
+    display_name = Column(String)
+    email = Column(String, unique=True)
+    password_hash = Column(String)
+    password_salt = Column(String)
+    is_active = Column(Boolean, nullable=False, server_default=text("1"))
+    locked_until = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Membership(Base):
+    __tablename__ = "memberships"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    role = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "user_id", name="uq_membership"),
+        CheckConstraint(
+            "role IN ('platform_admin','admin','auditor','user','tenant_admin','employee')",
+            name="ck_membership_role",
+        ),
+        Index("idx_memberships_tenant_role", "tenant_id", "role"),
+    )
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    action = Column(String, nullable=False)
+    target_type = Column(String)
+    target_id = Column(String)
+    metadata_json = Column(Text)
+    ip = Column(String)
+    user_agent = Column(String)
+    request_id = Column(String)
+    prev_hash = Column(String)
+    row_hash = Column(String)
+    chain_id = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_audit_logs_tenant_created", "tenant_id", "created_at"),
+        Index("idx_audit_logs_tenant_id", "tenant_id", "id"),
+        Index("idx_audit_logs_tenant_chain_id", "tenant_id", "chain_id", "id"),
+    )
+
+
+class TenantUsageDaily(Base):
+    __tablename__ = "tenant_usage_daily"
+
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
+    day = Column(String, primary_key=True)
+    request_count = Column(Integer, nullable=False, default=0)
+    token_count = Column(Integer, nullable=False, default=0)
+    blocked_count = Column(Integer, nullable=False, default=0)
+    risk_sum = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (Index("idx_usage_tenant_day", "tenant_id", "day"),)
+
+
+class TenantLimits(Base):
+    __tablename__ = "tenant_limits"
+
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
+    daily_requests_limit = Column(Integer, nullable=False)
+    rpm_limit = Column(Integer, nullable=False)
+    daily_token_limit = Column(Integer, nullable=False, default=DEFAULT_DAILY_TOKEN_LIMIT)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=text("1"))
+
+
+class TenantProviderConfig(Base):
+    __tablename__ = "tenant_provider_configs"
+
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
+    provider = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    api_key = Column(Text)
+    api_key_tail = Column(String)
+    base_url = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('gemini','openai','groq','anthropic','tavily')",
+            name="ck_provider_cfg_provider",
+        ),
+        Index("idx_provider_cfg_provider", "provider"),
+        Index("idx_provider_cfg_tenant", "tenant_id"),
+    )
+
+
+class TenantProviderKey(Base):
+    __tablename__ = "tenant_provider_keys"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    provider = Column(String, nullable=False)
+    api_key_enc = Column(Text, nullable=False)
+    api_key_tail = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "provider", name="uq_tenant_provider_key"),
+        CheckConstraint(
+            "provider IN ('gemini','openai','groq','anthropic','tavily')",
+            name="ck_provider_key_provider",
+        ),
+        Index("idx_provider_keys_tenant", "tenant_id"),
+    )
+
+
+class TenantPolicy(Base):
+    __tablename__ = "tenant_policies"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    rule_type = Column(String, nullable=False)
+    match = Column(String, nullable=False)
+    action = Column(String, nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=text("1"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("rule_type IN ('injection','category','severity')", name="ck_policy_rule_type"),
+        CheckConstraint("action IN ('ALLOW','REDACT','BLOCK')", name="ck_policy_action"),
+        Index("idx_policy_tenant_type", "tenant_id", "rule_type", "enabled"),
+    )
+
+
+class TenantPolicySettings(Base):
+    __tablename__ = "tenant_policy_settings"
+
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
+    pii_action = Column(String, nullable=False, server_default=text("'redact'"))
+    financial_action = Column(String, nullable=False, server_default=text("'redact'"))
+    secrets_action = Column(String, nullable=False, server_default=text("'block'"))
+    health_action = Column(String, nullable=False, server_default=text("'redact'"))
+    ip_action = Column(String, nullable=False, server_default=text("'redact'"))
+    block_threshold = Column(String, nullable=False, server_default=text("'critical'"))
+    store_original_prompt = Column(Boolean, nullable=False, default=True, server_default=text("1"))
+    show_sanitized_prompt_admin = Column(Boolean, nullable=False, default=True, server_default=text("1"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    input_json = Column(Text)
+    output_path = Column(String)
+    error = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('queued','running','done','failed')", name="ck_job_status"),
+        Index("idx_jobs_tenant_created", "tenant_id", "created_at"),
+        Index("idx_jobs_status_created", "status", "created_at"),
+    )
+
+
+class Request(Base):
+    """Requests table kept in enterprise layer for audit parity."""
+
+    __tablename__ = "requests"
+
+    id = Column(String, primary_key=True)
+    ts = Column(String)
+    user = Column(String)
+    purpose = Column(String)
+    model = Column(String)
+    provider = Column(String)
+    cleaned_prompt_preview = Column(Text)
+    prompt_original_preview = Column(Text)
+    prompt_sent_to_ai_preview = Column(Text)
+    detections_count = Column(Integer)
+    entity_counts_json = Column(Text)
+    risk_categories_json = Column(Text)
+    risk_score = Column(Integer)
+    risk_level = Column(String)
+    severity = Column(String)
+    decision = Column(String)
+    injection_detected = Column(Integer, default=0)
+    tenant_id = Column(Integer, default=1)
+
+    __table_args__ = (
+        Index("idx_requests_tenant_created", "tenant_id", "ts"),
+        Index("idx_requests_tenant_decision", "tenant_id", "decision"),
+        Index("idx_requests_tenant_provider", "tenant_id", "provider"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Session / connection helpers
+# --------------------------------------------------------------------------- #
+
+def get_engine() -> Engine:
+    return engine
+
+
+@contextmanager
+def get_session():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@contextmanager
+def get_conn():
+    """Provide a low‑level connection for legacy callers (uses SQLAlchemy engine)."""
+
+    with engine.begin() as conn:
+        yield conn
 
 
 def ensure_enterprise_schema() -> None:
-    """Create enterprise tables if they do not exist and apply additive migrations."""
-    with get_conn() as conn:
-        # Core tables
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenants (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT NOT NULL,
-              created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              external_id TEXT UNIQUE,
-              username TEXT UNIQUE,
-              display_name TEXT,
-              password_hash TEXT,
-              password_salt TEXT,
-              is_active INTEGER NOT NULL DEFAULT 1,
-              created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS memberships (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              tenant_id INTEGER NOT NULL,
-              user_id INTEGER NOT NULL,
-              role TEXT NOT NULL CHECK(role IN ('platform_admin','admin','auditor','user','tenant_admin','employee')),
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
-              UNIQUE(tenant_id, user_id),
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              tenant_id INTEGER NOT NULL,
-              user_id INTEGER,
-              action TEXT NOT NULL,
-              target_type TEXT,
-              target_id TEXT,
-              metadata_json TEXT,
-              ip TEXT,
-              user_agent TEXT,
-              request_id TEXT,
-              prev_hash TEXT,
-              row_hash TEXT,
-              chain_id TEXT,
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-            )
-            """
-        )
+    """Create all enterprise tables if missing."""
 
-        # Additive columns for older DBs
-        audit_cols = _table_columns(conn, "audit_logs")
-        if "prev_hash" not in audit_cols:
-            conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT")
-        if "row_hash" not in audit_cols:
-            conn.execute("ALTER TABLE audit_logs ADD COLUMN row_hash TEXT")
-        if "chain_id" not in audit_cols:
-            conn.execute("ALTER TABLE audit_logs ADD COLUMN chain_id TEXT")
-
-        _backfill_audit_chain_if_needed(conn)
-
-        # Additive columns for users table
-        user_cols = _table_columns(conn, "users")
-        if "username" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
-        if "password_hash" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
-        if "password_salt" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN password_salt TEXT")
-        if "is_active" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
-
-        memberships_sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memberships'"
-        ).fetchone()
-        memberships_sql = (memberships_sql_row[0] if memberships_sql_row and memberships_sql_row[0] else "").lower()
-        if "platform_admin" not in memberships_sql or "tenant_admin" not in memberships_sql:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memberships_v2 (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  tenant_id INTEGER NOT NULL,
-                  user_id INTEGER NOT NULL,
-                  role TEXT NOT NULL CHECK(role IN ('platform_admin','admin','auditor','user','tenant_admin','employee')),
-                  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                  UNIQUE(tenant_id, user_id),
-                  FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-                  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO memberships_v2 (id, tenant_id, user_id, role, created_at)
-                SELECT
-                  id,
-                  tenant_id,
-                  user_id,
-                  CASE
-                    WHEN role = 'admin' THEN 'platform_admin'
-                    WHEN role IN ('platform_admin', 'auditor', 'user', 'tenant_admin', 'employee') THEN role
-                    ELSE 'user'
-                  END,
-                  created_at
-                FROM memberships
-                """
-            )
-            conn.execute("DROP TABLE memberships")
-            conn.execute("ALTER TABLE memberships_v2 RENAME TO memberships")
-
-        # Additive columns for provider config (if table already exists in legacy DB)
-        existing_tables = {
-            str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
-        provider_cols: List[str] = []
-        if "tenant_provider_configs" in existing_tables:
-            provider_cols = _table_columns(conn, "tenant_provider_configs")
-            if "api_key_tail" not in provider_cols:
-                conn.execute("ALTER TABLE tenant_provider_configs ADD COLUMN api_key_tail TEXT")
-            if "base_url" not in provider_cols:
-                conn.execute("ALTER TABLE tenant_provider_configs ADD COLUMN base_url TEXT")
-            provider_cols = _table_columns(conn, "tenant_provider_configs")
-
-        # Limits and usage
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenant_usage_daily (
-              tenant_id INTEGER NOT NULL,
-              day TEXT NOT NULL,
-              request_count INTEGER NOT NULL DEFAULT 0,
-              token_count INTEGER NOT NULL DEFAULT 0,
-              blocked_count INTEGER NOT NULL DEFAULT 0,
-              risk_sum INTEGER NOT NULL DEFAULT 0,
-              updated_at TEXT NOT NULL,
-              PRIMARY KEY (tenant_id, day),
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-            )
-            """
-        )
-        usage_cols = _table_columns(conn, "tenant_usage_daily")
-        if "token_count" not in usage_cols:
-            conn.execute("ALTER TABLE tenant_usage_daily ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenant_limits (
-              tenant_id INTEGER PRIMARY KEY,
-              daily_requests_limit INTEGER NOT NULL,
-              rpm_limit INTEGER NOT NULL,
-              enabled INTEGER NOT NULL DEFAULT 1,
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenant_provider_configs (
-              tenant_id INTEGER PRIMARY KEY,
-              provider TEXT NOT NULL CHECK(provider IN ('gemini','openai','groq','anthropic')),
-              model TEXT NOT NULL,
-              api_key TEXT,
-              api_key_tail TEXT,
-              base_url TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenant_provider_keys (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              tenant_id INTEGER NOT NULL,
-              provider TEXT NOT NULL CHECK(provider IN ('gemini','openai','groq','anthropic')),
-              api_key_enc TEXT NOT NULL,
-              api_key_tail TEXT,
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
-              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-              UNIQUE(tenant_id, provider),
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-            )
-            """
-        )
-        provider_sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tenant_provider_configs'"
-        ).fetchone()
-        provider_sql = (provider_sql_row[0] if provider_sql_row and provider_sql_row[0] else "").lower()
-        provider_cols = _table_columns(conn, "tenant_provider_configs")
-        needs_provider_cfg_rebuild = (
-            "openai" not in provider_sql
-            or "anthropic" not in provider_sql
-            or "groq" not in provider_sql
-            or "base_url" not in provider_cols
-        )
-        if needs_provider_cfg_rebuild:
-            has_tail_col = "api_key_tail" in provider_cols
-            has_base_url_col = "base_url" in provider_cols
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tenant_provider_configs_v2 (
-                  tenant_id INTEGER PRIMARY KEY,
-                  provider TEXT NOT NULL CHECK(provider IN ('gemini','openai','groq','anthropic')),
-                  model TEXT NOT NULL,
-                  api_key TEXT,
-                  api_key_tail TEXT,
-                  base_url TEXT,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL,
-                  FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-                )
-                """
-            )
-            if has_tail_col and has_base_url_col:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO tenant_provider_configs_v2
-                      (tenant_id, provider, model, api_key, api_key_tail, base_url, created_at, updated_at)
-                    SELECT
-                      tenant_id,
-                      provider,
-                      model,
-                      api_key,
-                      COALESCE(api_key_tail, ''),
-                      NULLIF(TRIM(base_url), ''),
-                      created_at,
-                      updated_at
-                    FROM tenant_provider_configs
-                    """
-                )
-            elif has_tail_col:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO tenant_provider_configs_v2
-                      (tenant_id, provider, model, api_key, api_key_tail, base_url, created_at, updated_at)
-                    SELECT
-                      tenant_id,
-                      provider,
-                      model,
-                      api_key,
-                      COALESCE(api_key_tail, ''),
-                      NULL,
-                      created_at,
-                      updated_at
-                    FROM tenant_provider_configs
-                    """
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO tenant_provider_configs_v2
-                      (tenant_id, provider, model, api_key, api_key_tail, base_url, created_at, updated_at)
-                    SELECT
-                      tenant_id,
-                      provider,
-                      model,
-                      api_key,
-                      '',
-                      NULL,
-                      created_at,
-                      updated_at
-                    FROM tenant_provider_configs
-                    """
-                )
-            conn.execute("DROP TABLE tenant_provider_configs")
-            conn.execute("ALTER TABLE tenant_provider_configs_v2 RENAME TO tenant_provider_configs")
-
-        provider_keys_sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tenant_provider_keys'"
-        ).fetchone()
-        provider_keys_sql = (provider_keys_sql_row[0] if provider_keys_sql_row and provider_keys_sql_row[0] else "").lower()
-        needs_provider_keys_rebuild = (
-            "openai" not in provider_keys_sql
-            or "anthropic" not in provider_keys_sql
-            or "groq" not in provider_keys_sql
-        )
-        if needs_provider_keys_rebuild:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tenant_provider_keys_v2 (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  tenant_id INTEGER NOT NULL,
-                  provider TEXT NOT NULL CHECK(provider IN ('gemini','openai','groq','anthropic')),
-                  api_key_enc TEXT NOT NULL,
-                  api_key_tail TEXT,
-                  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                  UNIQUE(tenant_id, provider),
-                  FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO tenant_provider_keys_v2
-                  (id, tenant_id, provider, api_key_enc, api_key_tail, created_at, updated_at)
-                SELECT
-                  id, tenant_id, provider, api_key_enc, api_key_tail, created_at, updated_at
-                FROM tenant_provider_keys
-                """
-            )
-            conn.execute("DROP TABLE tenant_provider_keys")
-            conn.execute("ALTER TABLE tenant_provider_keys_v2 RENAME TO tenant_provider_keys")
-        conn.execute("DELETE FROM tenant_provider_keys WHERE provider = 'mock'")
-        conn.execute("DELETE FROM tenant_provider_configs WHERE provider = 'mock'")
-        _backfill_provider_keys_from_legacy(conn)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenant_policies (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              tenant_id INTEGER NOT NULL,
-              rule_type TEXT NOT NULL CHECK(rule_type IN ('injection','category','severity')),
-              match TEXT NOT NULL,
-              action TEXT NOT NULL CHECK(action IN ('ALLOW','REDACT','BLOCK')),
-              enabled INTEGER NOT NULL DEFAULT 1,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tenant_policy_settings (
-              tenant_id INTEGER PRIMARY KEY,
-              pii_action TEXT NOT NULL DEFAULT 'redact',
-              financial_action TEXT NOT NULL DEFAULT 'redact',
-              secrets_action TEXT NOT NULL DEFAULT 'block',
-              health_action TEXT NOT NULL DEFAULT 'redact',
-              ip_action TEXT NOT NULL DEFAULT 'redact',
-              block_threshold TEXT NOT NULL DEFAULT 'critical',
-              store_original_prompt INTEGER NOT NULL DEFAULT 1,
-              show_sanitized_prompt_admin INTEGER NOT NULL DEFAULT 1,
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
-              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-            )
-            """
-        )
-
-        # Jobs
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-              id TEXT PRIMARY KEY,
-              tenant_id INTEGER NOT NULL,
-              user_id INTEGER,
-              type TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('queued','running','done','failed')),
-              input_json TEXT,
-              output_path TEXT,
-              error TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-            )
-            """
-        )
-
-        # Indexes
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memberships_tenant_role ON memberships(tenant_id, role)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_created ON audit_logs(tenant_id, created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_id ON audit_logs(tenant_id, id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_chain_id ON audit_logs(tenant_id, chain_id, id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_tenant_day ON tenant_usage_daily(tenant_id, day)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_provider_cfg_provider ON tenant_provider_configs(provider)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_provider_cfg_tenant ON tenant_provider_configs(tenant_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_provider_keys_tenant ON tenant_provider_keys(tenant_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_tenant_type ON tenant_policies(tenant_id, rule_type, enabled)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant_created ON jobs(tenant_id, created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
-
-        # Seed default tenant if missing
-        conn.execute(
-            """
-            INSERT INTO tenants (name)
-            SELECT 'Default Tenant'
-            WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE name = 'Default Tenant')
-            """
-        )
-
-        # Seed limits for all existing tenants if missing
-        conn.execute(
-            """
-            INSERT INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, enabled)
-            SELECT t.id, ?, ?, 1
-            FROM tenants t
-            LEFT JOIN tenant_limits l ON l.tenant_id = t.id
-            WHERE l.tenant_id IS NULL
-            """,
-            (DEFAULT_DAILY_REQUESTS_LIMIT, DEFAULT_RPM_LIMIT),
-        )
-        conn.execute(
-            """
-            INSERT INTO tenant_policy_settings (
-              tenant_id,
-              pii_action,
-              financial_action,
-              secrets_action,
-              health_action,
-              ip_action,
-              block_threshold,
-              store_original_prompt,
-              show_sanitized_prompt_admin,
-              created_at,
-              updated_at
-            )
-            SELECT
-              t.id,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?,
-              ?
-            FROM tenants t
-            LEFT JOIN tenant_policy_settings s ON s.tenant_id = t.id
-            WHERE s.tenant_id IS NULL
-            """,
-            (
-                str(DEFAULT_TENANT_POLICY_SETTINGS["pii_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["financial_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["secrets_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["health_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["ip_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["block_threshold"]),
-                int(bool(DEFAULT_TENANT_POLICY_SETTINGS["store_original_prompt"])),
-                int(bool(DEFAULT_TENANT_POLICY_SETTINGS["show_sanitized_prompt_admin"])),
-                _utcnow_iso(),
-                _utcnow_iso(),
-            ),
-        )
-
-        conn.execute(
-            """
-            UPDATE users
-            SET username = external_id
-            WHERE (username IS NULL OR username = '')
-              AND external_id IS NOT NULL
-              AND external_id != ''
-            """
-        )
-
-        now = _utcnow_iso()
-        conn.execute(
-            """
-            INSERT INTO tenant_policies (tenant_id, rule_type, match, action, enabled, created_at, updated_at)
-            SELECT t.id, 'injection', 'PROMPT_INJECTION', 'BLOCK', 1, ?, ?
-            FROM tenants t
-            LEFT JOIN tenant_policies p
-              ON p.tenant_id = t.id
-             AND p.rule_type = 'injection'
-             AND p.match = 'PROMPT_INJECTION'
-            WHERE p.id IS NULL
-            """,
-            (now, now),
-        )
+    Base.metadata.create_all(bind=engine)
 
 
-def ensure_user(external_id: Optional[str]) -> Optional[int]:
-    if not external_id:
-        return None
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        cur = conn.execute("SELECT id, username FROM users WHERE external_id = ?", (external_id,))
-        row = cur.fetchone()
-        if row:
-            if not row["username"]:
-                conn.execute("UPDATE users SET username = ? WHERE id = ?", (external_id, int(row["id"])))
-            return int(row["id"])
-        cur = conn.execute(
-            "INSERT INTO users (external_id, username, display_name) VALUES (?, ?, ?)",
-            (external_id, external_id, external_id),
-        )
-        return int(cur.lastrowid)
+# --------------------------------------------------------------------------- #
+# Tenant helpers
+# --------------------------------------------------------------------------- #
+
+def _ensure_default_tenant(session) -> Tenant:
+    tenant = session.execute(select(Tenant).order_by(Tenant.id)).scalar_one_or_none()
+    if tenant:
+        return tenant
+    tenant = Tenant(name="Default Tenant", is_personal=False)
+    session.add(tenant)
+    session.flush()
+    return tenant
 
 
 def get_default_tenant_id() -> int:
     ensure_enterprise_schema()
-    with get_conn() as conn:
-        cur = conn.execute("SELECT id FROM tenants ORDER BY id ASC LIMIT 1")
-        row = cur.fetchone()
-        if row:
-            return int(row["id"])
-        cur = conn.execute("INSERT INTO tenants (name) VALUES ('Default Tenant')")
-        return int(cur.lastrowid)
+    with get_session() as session:
+        tenant = _ensure_default_tenant(session)
+        return int(tenant.id)
 
 
-def create_tenant(name: str) -> int:
+# --------------------------------------------------------------------------- #
+# User helpers
+# --------------------------------------------------------------------------- #
+
+def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     ensure_enterprise_schema()
-    name = (name or "").strip() or "Unnamed Tenant"
-    with get_conn() as conn:
-        cur = conn.execute("INSERT INTO tenants (name) VALUES (?)", (name,))
-        tenant_id = int(cur.lastrowid)
-        now = _utcnow_iso()
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, enabled)
-            VALUES (?, ?, ?, 1)
-            """,
-            (tenant_id, DEFAULT_DAILY_REQUESTS_LIMIT, DEFAULT_RPM_LIMIT),
+    value = (username or "").strip()
+    if not value:
+        return None
+    with get_session() as session:
+        row = session.execute(
+            select(User).where(func.lower(User.username) == func.lower(value))
+        ).scalar_one_or_none()
+        return _model_to_dict(row) if row else None
+
+
+def ensure_user(external_user: Optional[str]) -> Optional[int]:
+    ensure_enterprise_schema()
+    username = (external_user or "").strip()
+    if not username:
+        return None
+
+    with get_session() as session:
+        existing = session.execute(
+            select(User).where(func.lower(User.username) == func.lower(username))
+        ).scalar_one_or_none()
+        if existing:
+            return int(existing.id)
+        user = User(
+            external_id=username,
+            username=username,
+            display_name=username,
+            email=username if "@" in username else None,
+            is_active=True,
         )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO tenant_policy_settings (
-              tenant_id,
-              pii_action,
-              financial_action,
-              secrets_action,
-              health_action,
-              ip_action,
-              block_threshold,
-              store_original_prompt,
-              show_sanitized_prompt_admin,
-              created_at,
-              updated_at
+        session.add(user)
+        session.flush()
+        return int(user.id)
+
+
+def get_role(tenant_id: int, user_id: Optional[int]) -> str:
+    ensure_enterprise_schema()
+    if not user_id:
+        return "user"
+    with get_session() as session:
+        membership = session.execute(
+            select(Membership.role).where(
+                Membership.tenant_id == int(tenant_id), Membership.user_id == int(user_id)
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                tenant_id,
-                str(DEFAULT_TENANT_POLICY_SETTINGS["pii_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["financial_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["secrets_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["health_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["ip_action"]),
-                str(DEFAULT_TENANT_POLICY_SETTINGS["block_threshold"]),
-                int(bool(DEFAULT_TENANT_POLICY_SETTINGS["store_original_prompt"])),
-                int(bool(DEFAULT_TENANT_POLICY_SETTINGS["show_sanitized_prompt_admin"])),
-                now,
-                now,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO tenant_policies (tenant_id, rule_type, match, action, enabled, created_at, updated_at)
-            VALUES (?, 'injection', 'PROMPT_INJECTION', 'BLOCK', 1, ?, ?)
-            """,
-            (tenant_id, now, now),
-        )
-        return tenant_id
+        ).scalar_one_or_none()
+        return _normalize_role_name(membership or "user")
 
 
-def list_tenants() -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        rows = conn.execute("SELECT id, name, created_at FROM tenants ORDER BY id ASC").fetchall()
-        return [dict(r) for r in rows]
+# --------------------------------------------------------------------------- #
+# Provider configuration helpers
+# --------------------------------------------------------------------------- #
 
-
-def _env_default_provider_config() -> Dict[str, Any]:
-    raw_provider = str(os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER) or "").strip().lower()
-    provider = raw_provider if raw_provider in ROUTING_PROVIDER_PRIORITY else DEFAULT_PROVIDER
-    model = default_model_for_provider(provider)
-    api_key = _provider_env_api_key(provider)
-    base_url = default_base_url_for_provider(provider)
-    return {
-        "provider": provider,
-        "model": model,
-        "api_key": api_key,
-        "api_key_tail": mask_key_tail(api_key),
-        "base_url": base_url,
-        "source": "env",
-    }
-
-
-def _provider_env_api_key(provider: str) -> str:
-    provider_name = _safe_provider_name(provider)
-    if not provider_name:
-        return ""
-    if provider_name == "gemini":
+def _env_api_key(provider: str) -> str:
+    name = normalize_provider_name(provider)
+    if name == "gemini":
         return os.getenv("GEMINI_API_KEY", "").strip()
-    if provider_name == "openai":
+    if name == "openai":
         return os.getenv("OPENAI_API_KEY", "").strip()
-    if provider_name == "groq":
+    if name == "groq":
         return os.getenv("GROQ_API_KEY", "").strip()
-    if provider_name == "anthropic":
+    if name == "anthropic":
         return os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if name == "tavily":
+        return os.getenv("TAVILY_API_KEY", "").strip()
     return ""
 
 
-def upsert_tenant_key(tenant_id: int, provider: str, api_key_plain: str) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    provider_normalized = (provider or "").strip().lower()
-    if provider_normalized == "tavily":
-        provider_name = "tavily"
-    else:
-        provider_name = normalize_provider_name(provider)
-    plain = (api_key_plain or "").strip()
-    if not plain:
-        raise ValueError("api_key is required")
+def _ensure_provider_config(session, tenant_id: int) -> TenantProviderConfig:
+    cfg = session.execute(
+        select(TenantProviderConfig).where(TenantProviderConfig.tenant_id == int(tenant_id))
+    ).scalar_one_or_none()
+    if cfg:
+        return cfg
 
-    encrypted = encrypt_secret(plain)
-    tail = mask_key_tail(plain)
-    now = _utcnow_iso()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO tenant_provider_keys (tenant_id, provider, api_key_enc, api_key_tail, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id, provider) DO UPDATE SET
-              api_key_enc = excluded.api_key_enc,
-              api_key_tail = excluded.api_key_tail,
-              updated_at = excluded.updated_at
-            """,
-            (int(tenant_id), provider_name, encrypted, tail, now, now),
-        )
-    return {
+    provider = normalize_provider_name(os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER))
+    model = validate_model_for_provider(provider, None)
+    base_url = normalize_optional_base_url(default_base_url_for_provider(provider))
+    cfg = TenantProviderConfig(
+        tenant_id=int(tenant_id),
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=None,
+        api_key_tail=None,
+    )
+    session.add(cfg)
+    session.flush()
+    return cfg
+
+
+def set_tenant_provider_key(tenant_id: int, provider: str, api_key: str) -> Dict[str, Any]:
+    """Upsert an encrypted provider key for a tenant."""
+
+    ensure_enterprise_schema()
+    provider_name = _safe_key_provider(provider) or normalize_provider_name(provider)
+    enc = encrypt_secret(api_key)
+    tail = mask_key_tail(api_key)
+    values = {
+        "tenant_id": int(tenant_id),
         "provider": provider_name,
-        "has_key": bool(plain),
+        "api_key_enc": enc,
         "api_key_tail": tail,
-        "updated_at": now,
     }
-
-
-def list_tenant_keys(tenant_id: int) -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT provider, api_key_enc, api_key_tail, updated_at
-            FROM tenant_provider_keys
-            WHERE tenant_id = ?
-            ORDER BY provider ASC
-            """,
-            (int(tenant_id),),
-        ).fetchall()
-
-    by_provider: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        provider = _safe_key_provider(row["provider"])
-        if not provider:
-            continue
-        by_provider[provider] = {
-            "provider": provider,
-            "has_key": bool((row["api_key_enc"] or "").strip()),
-            "api_key_tail": (row["api_key_tail"] or "").strip() or None,
-            "updated_at": row["updated_at"],
-        }
-
-    ordered = KEY_PROVIDER_PRIORITY
-    items: List[Dict[str, Any]] = []
-    for provider in ordered:
-        if provider in by_provider:
-            items.append(by_provider[provider])
-        else:
-            items.append(
-                {
-                    "provider": provider,
-                    "has_key": False,
-                    "api_key_tail": None,
-                    "updated_at": None,
-                }
-            )
-    for provider in by_provider:
-        if provider not in ordered:
-            items.append(by_provider[provider])
-    return items
-
-
-def delete_tenant_key(tenant_id: int, provider: str) -> bool:
-    ensure_enterprise_schema()
-    provider_normalized = (provider or "").strip().lower()
-    if provider_normalized == "tavily":
-        provider_name = "tavily"
-    else:
-        provider_name = normalize_provider_name(provider)
-    with get_conn() as conn:
-        cur = conn.execute(
-            "DELETE FROM tenant_provider_keys WHERE tenant_id = ? AND provider = ?",
-            (int(tenant_id), provider_name),
+    with get_session() as session:
+        stmt = _dialect_insert(TenantProviderKey).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[TenantProviderKey.tenant_id, TenantProviderKey.provider],
+            set_=values,
         )
-    return int(cur.rowcount or 0) > 0
+        session.execute(stmt)
+        session.flush()
+        return values
 
 
-def get_tenant_tavily_key(tenant_id: int) -> Dict[str, Any]:
+def get_tenant_provider_config(tenant_id: int) -> Dict[str, Any]:
+    """Return provider configuration metadata (excludes decrypted key)."""
+
     ensure_enterprise_schema()
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT api_key_enc, api_key_tail, updated_at
-            FROM tenant_provider_keys
-            WHERE tenant_id = ? AND provider = 'tavily'
-            """,
-            (int(tenant_id),),
-        ).fetchone()
-    if row and (row["api_key_enc"] or "").strip():
-        try:
-            key = decrypt_secret(row["api_key_enc"])
-        except Exception:
-            key = ""
-        tail = (row["api_key_tail"] or "").strip() or (mask_key_tail(key) if key else None)
-        return {
-            "api_key": key,
-            "api_key_tail": tail,
-            "source": "tenant",
-            "updated_at": row["updated_at"],
-        }
-    env_key = os.getenv("TAVILY_API_KEY", "").strip()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        cfg = _ensure_provider_config(session, tenant_id)
+        key_row = session.execute(
+            select(TenantProviderKey).where(
+                TenantProviderKey.tenant_id == int(tenant_id),
+                TenantProviderKey.provider == cfg.provider,
+            )
+        ).scalar_one_or_none()
+
+    env_key = _env_api_key(cfg.provider)
+    has_api_key = bool((key_row and key_row.api_key_enc) or env_key)
+    api_key_tail = key_row.api_key_tail if key_row else mask_key_tail(env_key)
+
     return {
-        "api_key": env_key,
-        "api_key_tail": mask_key_tail(env_key) if env_key else None,
-        "source": "env" if env_key else "none",
-        "updated_at": None,
-    }
-
-
-def _resolve_provider_key_runtime(
-    tenant_id: int,
-    provider: str,
-    *,
-    legacy_key: Optional[str] = None,
-    legacy_tail: Optional[str] = None,
-) -> Dict[str, Any]:
-    provider_name = normalize_provider_name(provider)
-
-    with get_conn() as conn:
-        key_row = conn.execute(
-            """
-            SELECT api_key_enc, api_key_tail, updated_at
-            FROM tenant_provider_keys
-            WHERE tenant_id = ? AND provider = ?
-            """,
-            (int(tenant_id), provider_name),
-        ).fetchone()
-
-    if key_row:
-        stored_key = (key_row["api_key_enc"] or "").strip()
-        stored_tail = (key_row["api_key_tail"] or "").strip() or None
-
-        if stored_key and not is_encrypted_secret(stored_key):
-            plain_legacy = stored_key
-            encrypted = encrypt_secret(plain_legacy)
-            migrated_tail = mask_key_tail(plain_legacy)
-            with get_conn() as conn:
-                conn.execute(
-                    """
-                    UPDATE tenant_provider_keys
-                    SET api_key_enc = ?, api_key_tail = ?, updated_at = ?
-                    WHERE tenant_id = ? AND provider = ?
-                    """,
-                    (encrypted, migrated_tail, _utcnow_iso(), int(tenant_id), provider_name),
-                )
-            stored_key = encrypted
-            stored_tail = migrated_tail
-
-        try:
-            plain = decrypt_secret(stored_key)
-        except ValueError:
-            plain = ""
-        return {
-            "api_key": plain,
-            "api_key_tail": stored_tail or mask_key_tail(plain),
-            "source": "tenant_keys",
-        }
-
-    legacy_stored_key = (legacy_key or "").strip()
-    legacy_stored_tail = (legacy_tail or "").strip() or None
-    if legacy_stored_key:
-        if not is_encrypted_secret(legacy_stored_key):
-            plain_legacy = legacy_stored_key
-            encrypted = encrypt_secret(plain_legacy)
-            migrated_tail = mask_key_tail(plain_legacy)
-            with get_conn() as conn:
-                conn.execute(
-                    """
-                    UPDATE tenant_provider_configs
-                    SET api_key = ?, api_key_tail = ?, updated_at = ?
-                    WHERE tenant_id = ?
-                    """,
-                    (encrypted, migrated_tail, _utcnow_iso(), int(tenant_id)),
-                )
-            legacy_stored_key = encrypted
-            legacy_stored_tail = migrated_tail
-
-        try:
-            plain_legacy_key = decrypt_secret(legacy_stored_key)
-        except ValueError:
-            plain_legacy_key = ""
-
-        if plain_legacy_key:
-            try:
-                upsert_tenant_key(tenant_id=tenant_id, provider=provider_name, api_key_plain=plain_legacy_key)
-                with get_conn() as conn:
-                    conn.execute(
-                        """
-                        UPDATE tenant_provider_configs
-                        SET api_key = '', api_key_tail = COALESCE(api_key_tail, ?), updated_at = ?
-                        WHERE tenant_id = ?
-                        """,
-                        (mask_key_tail(plain_legacy_key), _utcnow_iso(), int(tenant_id)),
-                    )
-            except Exception:
-                pass
-        return {
-            "api_key": plain_legacy_key,
-            "api_key_tail": legacy_stored_tail or mask_key_tail(plain_legacy_key),
-            "source": "legacy_config",
-        }
-
-    env_key = _provider_env_api_key(provider_name)
-    return {
-        "api_key": env_key,
-        "api_key_tail": mask_key_tail(env_key),
-        "source": "env",
+        "tenant_id": int(tenant_id),
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "base_url": cfg.base_url,
+        "source": "db" if key_row else "env" if env_key else "none",
+        "has_api_key": has_api_key,
+        "api_key_tail": api_key_tail,
     }
 
 
 def get_tenant_provider_runtime_config(tenant_id: int) -> Dict[str, Any]:
-    """
-    Internal provider config including raw API key.
-    Falls back to environment defaults when tenant config is missing.
-    """
+    """Return provider configuration including the decrypted API key."""
+
     ensure_enterprise_schema()
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT tenant_id, provider, model, api_key, api_key_tail, base_url, created_at, updated_at
-            FROM tenant_provider_configs
-            WHERE tenant_id = ?
-            """,
-            (int(tenant_id),),
-        ).fetchone()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        cfg = _ensure_provider_config(session, tenant_id)
+        key_row = session.execute(
+            select(TenantProviderKey).where(
+                TenantProviderKey.tenant_id == int(tenant_id),
+                TenantProviderKey.provider == cfg.provider,
+            )
+        ).scalar_one_or_none()
 
-    row_provider = _safe_provider_name(row["provider"]) if row else None
-    row_model = (row["model"] or "").strip() if row else ""
-    row_base_url = normalize_optional_base_url((row["base_url"] or "").strip()) if row else None
-    row_created_at = row["created_at"] if row else None
-    row_updated_at = row["updated_at"] if row else None
-
-    if row_provider and row_model:
-        try:
-            normalized_row_model = validate_model_for_provider(row_provider, row_model)
-        except ValueError:
-            normalized_row_model = default_model_for_provider(row_provider)
-
-        if normalized_row_model != row_model:
-            row_model = normalized_row_model
-            row_updated_at = _utcnow_iso()
-            try:
-                with get_conn() as conn:
-                    conn.execute(
-                        """
-                        UPDATE tenant_provider_configs
-                        SET model = ?, updated_at = ?
-                        WHERE tenant_id = ? AND provider = ?
-                        """,
-                        (row_model, row_updated_at, int(tenant_id), row_provider),
-                    )
-            except Exception:
-                pass
-
-    candidates: List[str] = []
-    if row_provider:
-        candidates.append(row_provider)
-    for provider in ROUTING_PROVIDER_PRIORITY:
-        if provider not in candidates:
-            candidates.append(provider)
-
-    for provider in candidates:
-        key_state = _resolve_provider_key_runtime(
-            tenant_id=int(tenant_id),
-            provider=provider,
-            legacy_key=(row["api_key"] or "").strip() if row and provider == row_provider else None,
-            legacy_tail=((row["api_key_tail"] or "").strip() or None) if row and provider == row_provider else None,
-        )
-        api_key = (key_state.get("api_key") or "").strip()
-        if not api_key:
-            continue
-
-        if provider == row_provider and row_model:
-            model = row_model
-        else:
-            model = default_model_for_provider(provider)
-        if provider == row_provider:
-            base_url = row_base_url
-        else:
-            base_url = default_base_url_for_provider(provider)
-        if provider == "groq" and not base_url:
-            base_url = default_base_url_for_provider("groq")
-        if provider not in ("openai", "groq"):
-            base_url = None
-
-        if row and provider == row_provider:
-            source = "tenant"
-        elif key_state.get("source") == "env" and not row:
-            source = "env"
-        else:
-            source = "fallback"
-
-        return {
-            "tenant_id": int(tenant_id),
-            "provider": provider,
-            "model": model,
-            "api_key": api_key,
-            "api_key_tail": key_state.get("api_key_tail") or mask_key_tail(api_key),
-            "base_url": base_url,
-            "source": source,
-            "created_at": row_created_at,
-            "updated_at": row_updated_at,
-        }
+    env_key = _env_api_key(cfg.provider)
+    api_key = ""
+    source = "none"
+    if key_row and key_row.api_key_enc:
+        api_key = decrypt_secret(key_row.api_key_enc)
+        source = "db"
+    elif env_key:
+        api_key = env_key
+        source = "env"
 
     return {
         "tenant_id": int(tenant_id),
-        "provider": "none",
-        "model": "",
-        "api_key": "",
-        "api_key_tail": None,
-        "base_url": None,
-        "source": "none",
-        "created_at": row_created_at,
-        "updated_at": row_updated_at,
-    }
-
-
-def get_tenant_provider_config(tenant_id: int) -> Dict[str, Any]:
-    """Safe provider config for API responses (key tail only, no secret decryption)."""
-    runtime = get_tenant_provider_runtime_config(tenant_id)
-    api_key = (runtime.get("api_key") or "").strip()
-    return {
-        "tenant_id": int(runtime["tenant_id"]),
-        "provider": str(runtime.get("provider") or "none"),
-        "model": str(runtime.get("model") or ""),
-        "base_url": runtime.get("base_url"),
-        "source": str(runtime.get("source") or "none"),
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "base_url": cfg.base_url,
+        "api_key": api_key,
+        "api_key_tail": key_row.api_key_tail if key_row else mask_key_tail(api_key),
+        "source": source,
         "has_api_key": bool(api_key),
-        "api_key_tail": runtime.get("api_key_tail"),
-        "created_at": runtime.get("created_at"),
-        "updated_at": runtime.get("updated_at"),
     }
 
 
-def upsert_tenant_provider_config(
-    tenant_id: int,
-    provider: str,
-    model: Optional[str] = None,
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    provider_name = normalize_provider_name(provider)
-    normalized_model = validate_model_for_provider(
-        provider_name,
-        (model or "").strip() or default_model_for_provider(provider_name),
+# --------------------------------------------------------------------------- #
+# Limits and usage
+# --------------------------------------------------------------------------- #
+
+def _ensure_tenant_limits(session, tenant_id: int) -> TenantLimits:
+    limits = session.execute(
+        select(TenantLimits).where(TenantLimits.tenant_id == int(tenant_id))
+    ).scalar_one_or_none()
+    if limits:
+        return limits
+    limits = TenantLimits(
+        tenant_id=int(tenant_id),
+        daily_requests_limit=DEFAULT_DAILY_REQUESTS_LIMIT,
+        rpm_limit=DEFAULT_RPM_LIMIT,
+        daily_token_limit=DEFAULT_DAILY_TOKEN_LIMIT,
+        enabled=True,
     )
-    incoming_key = (api_key or "").strip() if api_key is not None else None
-    incoming_base_url = normalize_optional_base_url(base_url)
+    session.add(limits)
+    session.flush()
+    return limits
 
-    if incoming_key is not None:
-        upsert_tenant_key(tenant_id=tenant_id, provider=provider_name, api_key_plain=incoming_key)
 
-    with get_conn() as conn:
-        existing_row = conn.execute(
-            """
-            SELECT provider, base_url
-            FROM tenant_provider_configs
-            WHERE tenant_id = ?
-            """,
-            (int(tenant_id),),
-        ).fetchone()
+def get_tenant_limits(tenant_id: int) -> Dict[str, Any]:
+    ensure_enterprise_schema()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        limits = _ensure_tenant_limits(session, tenant_id)
+        return _model_to_dict(limits)
 
-    existing_provider = _safe_provider_name(existing_row["provider"]) if existing_row else None
-    existing_base_url = (
-        normalize_optional_base_url((existing_row["base_url"] or "").strip()) if existing_row else None
+
+def _ensure_usage_row(session, tenant_id: int, day: str) -> TenantUsageDaily:
+    row = session.execute(
+        select(TenantUsageDaily).where(
+            TenantUsageDaily.tenant_id == int(tenant_id), TenantUsageDaily.day == str(day)
+        )
+    ).scalar_one_or_none()
+    if row:
+        return row
+    row = TenantUsageDaily(
+        tenant_id=int(tenant_id),
+        day=str(day),
+        request_count=0,
+        token_count=0,
+        blocked_count=0,
+        risk_sum=0,
     )
-    if incoming_base_url is None and existing_provider == provider_name:
-        normalized_base_url = existing_base_url
-    else:
-        normalized_base_url = incoming_base_url
-    if provider_name == "groq" and not normalized_base_url:
-        normalized_base_url = default_base_url_for_provider("groq")
-    if provider_name not in ("openai", "groq"):
-        normalized_base_url = None
-
-    key_tail = None
-    key_map = {
-        str(item["provider"]): item
-        for item in list_tenant_keys(int(tenant_id))
-        if isinstance(item, dict)
-    }
-    if provider_name in key_map:
-        key_tail = key_map[provider_name].get("api_key_tail")
-
-    now = _utcnow_iso()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO tenant_provider_configs (
-              tenant_id, provider, model, api_key, api_key_tail, base_url, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id) DO UPDATE SET
-              provider = excluded.provider,
-              model = excluded.model,
-              api_key = excluded.api_key,
-              api_key_tail = excluded.api_key_tail,
-              base_url = excluded.base_url,
-              updated_at = excluded.updated_at
-            """,
-            (int(tenant_id), provider_name, normalized_model, "", key_tail, normalized_base_url, now, now),
-        )
-    return get_tenant_provider_config(tenant_id)
-
-
-def _normalize_policy_action(value: str, field_name: str) -> str:
-    action = str(value or "").strip().lower()
-    if action not in POLICY_ACTIONS:
-        raise ValueError(f"{field_name} must be one of: allow, redact, block")
-    return action
-
-
-def _normalize_block_threshold(value: str) -> str:
-    threshold = str(value or "").strip().lower()
-    if threshold not in POLICY_BLOCK_THRESHOLDS:
-        raise ValueError("block_threshold must be one of: high, critical")
-    return threshold
-
-
-def get_tenant_policy_settings(tenant_id: int) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT
-              tenant_id,
-              pii_action,
-              financial_action,
-              secrets_action,
-              health_action,
-              ip_action,
-              block_threshold,
-              store_original_prompt,
-              show_sanitized_prompt_admin,
-              created_at,
-              updated_at
-            FROM tenant_policy_settings
-            WHERE tenant_id = ?
-            """,
-            (int(tenant_id),),
-        ).fetchone()
-        if not row:
-            now = _utcnow_iso()
-            conn.execute(
-                """
-                INSERT INTO tenant_policy_settings (
-                  tenant_id,
-                  pii_action,
-                  financial_action,
-                  secrets_action,
-                  health_action,
-                  ip_action,
-                  block_threshold,
-                  store_original_prompt,
-                  show_sanitized_prompt_admin,
-                  created_at,
-                  updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(tenant_id),
-                    str(DEFAULT_TENANT_POLICY_SETTINGS["pii_action"]),
-                    str(DEFAULT_TENANT_POLICY_SETTINGS["financial_action"]),
-                    str(DEFAULT_TENANT_POLICY_SETTINGS["secrets_action"]),
-                    str(DEFAULT_TENANT_POLICY_SETTINGS["health_action"]),
-                    str(DEFAULT_TENANT_POLICY_SETTINGS["ip_action"]),
-                    str(DEFAULT_TENANT_POLICY_SETTINGS["block_threshold"]),
-                    int(bool(DEFAULT_TENANT_POLICY_SETTINGS["store_original_prompt"])),
-                    int(bool(DEFAULT_TENANT_POLICY_SETTINGS["show_sanitized_prompt_admin"])),
-                    now,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                """
-                SELECT
-                  tenant_id,
-                  pii_action,
-                  financial_action,
-                  secrets_action,
-                  health_action,
-                  ip_action,
-                  block_threshold,
-                  store_original_prompt,
-                  show_sanitized_prompt_admin,
-                  created_at,
-                  updated_at
-                FROM tenant_policy_settings
-                WHERE tenant_id = ?
-                """,
-                (int(tenant_id),),
-            ).fetchone()
-
-    return {
-        "tenant_id": int(row["tenant_id"]),
-        "pii_action": str(row["pii_action"]).lower(),
-        "financial_action": str(row["financial_action"]).lower(),
-        "secrets_action": str(row["secrets_action"]).lower(),
-        "health_action": str(row["health_action"]).lower(),
-        "ip_action": str(row["ip_action"]).lower(),
-        "block_threshold": str(row["block_threshold"]).lower(),
-        "store_original_prompt": bool(int(row["store_original_prompt"])),
-        "show_sanitized_prompt_admin": bool(int(row["show_sanitized_prompt_admin"])),
-        "created_at": str(row["created_at"] or ""),
-        "updated_at": str(row["updated_at"] or ""),
-    }
-
-
-def upsert_tenant_policy_settings(
-    tenant_id: int,
-    *,
-    pii_action: Optional[str] = None,
-    financial_action: Optional[str] = None,
-    secrets_action: Optional[str] = None,
-    health_action: Optional[str] = None,
-    ip_action: Optional[str] = None,
-    block_threshold: Optional[str] = None,
-    store_original_prompt: Optional[bool] = None,
-    show_sanitized_prompt_admin: Optional[bool] = None,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    current = get_tenant_policy_settings(int(tenant_id))
-
-    resolved = {
-        "pii_action": _normalize_policy_action(
-            pii_action if pii_action is not None else str(current["pii_action"]),
-            "pii_action",
-        ),
-        "financial_action": _normalize_policy_action(
-            financial_action if financial_action is not None else str(current["financial_action"]),
-            "financial_action",
-        ),
-        "secrets_action": _normalize_policy_action(
-            secrets_action if secrets_action is not None else str(current["secrets_action"]),
-            "secrets_action",
-        ),
-        "health_action": _normalize_policy_action(
-            health_action if health_action is not None else str(current["health_action"]),
-            "health_action",
-        ),
-        "ip_action": _normalize_policy_action(
-            ip_action if ip_action is not None else str(current["ip_action"]),
-            "ip_action",
-        ),
-        "block_threshold": _normalize_block_threshold(
-            block_threshold if block_threshold is not None else str(current["block_threshold"])
-        ),
-        "store_original_prompt": (
-            bool(store_original_prompt)
-            if store_original_prompt is not None
-            else bool(current["store_original_prompt"])
-        ),
-        "show_sanitized_prompt_admin": (
-            bool(show_sanitized_prompt_admin)
-            if show_sanitized_prompt_admin is not None
-            else bool(current["show_sanitized_prompt_admin"])
-        ),
-    }
-
-    now = _utcnow_iso()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO tenant_policy_settings (
-              tenant_id,
-              pii_action,
-              financial_action,
-              secrets_action,
-              health_action,
-              ip_action,
-              block_threshold,
-              store_original_prompt,
-              show_sanitized_prompt_admin,
-              created_at,
-              updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id) DO UPDATE SET
-              pii_action = excluded.pii_action,
-              financial_action = excluded.financial_action,
-              secrets_action = excluded.secrets_action,
-              health_action = excluded.health_action,
-              ip_action = excluded.ip_action,
-              block_threshold = excluded.block_threshold,
-              store_original_prompt = excluded.store_original_prompt,
-              show_sanitized_prompt_admin = excluded.show_sanitized_prompt_admin,
-              updated_at = excluded.updated_at
-            """,
-            (
-                int(tenant_id),
-                resolved["pii_action"],
-                resolved["financial_action"],
-                resolved["secrets_action"],
-                resolved["health_action"],
-                resolved["ip_action"],
-                resolved["block_threshold"],
-                int(resolved["store_original_prompt"]),
-                int(resolved["show_sanitized_prompt_admin"]),
-                str(current.get("created_at") or now),
-                now,
-            ),
-        )
-    return get_tenant_policy_settings(int(tenant_id))
-
-
-def list_policy_rules(tenant_id: int) -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, tenant_id, rule_type, match, action, enabled, created_at, updated_at
-            FROM tenant_policies
-            WHERE tenant_id = ?
-            ORDER BY id ASC
-            """,
-            (int(tenant_id),),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def create_policy_rule(
-    tenant_id: int,
-    *,
-    rule_type: str,
-    match: str,
-    action: str,
-    enabled: bool = True,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    rt = (rule_type or "").strip().lower()
-    mv = (match or "").strip()
-    act = (action or "").strip().upper()
-    if rt not in {"injection", "category", "severity"}:
-        raise ValueError("Invalid rule_type")
-    if not mv:
-        raise ValueError("match is required")
-    if act not in {"ALLOW", "REDACT", "BLOCK"}:
-        raise ValueError("Invalid action")
-    now = _utcnow_iso()
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO tenant_policies (tenant_id, rule_type, match, action, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (int(tenant_id), rt, mv.upper(), act, int(bool(enabled)), now, now),
-        )
-        rule_id = int(cur.lastrowid)
-        row = conn.execute(
-            """
-            SELECT id, tenant_id, rule_type, match, action, enabled, created_at, updated_at
-            FROM tenant_policies
-            WHERE id = ?
-            """,
-            (rule_id,),
-        ).fetchone()
-    return dict(row)
-
-
-def update_policy_rule(
-    tenant_id: int,
-    rule_id: int,
-    *,
-    rule_type: Optional[str] = None,
-    match: Optional[str] = None,
-    action: Optional[str] = None,
-    enabled: Optional[bool] = None,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    current = None
-    with get_conn() as conn:
-        current = conn.execute(
-            """
-            SELECT id, tenant_id, rule_type, match, action, enabled, created_at, updated_at
-            FROM tenant_policies
-            WHERE id = ? AND tenant_id = ?
-            """,
-            (int(rule_id), int(tenant_id)),
-        ).fetchone()
-        if not current:
-            raise ValueError("Rule not found")
-
-        new_rule_type = (rule_type or current["rule_type"]).strip().lower()
-        new_match = (match or current["match"]).strip().upper()
-        new_action = (action or current["action"]).strip().upper()
-        new_enabled = int(bool(enabled)) if enabled is not None else int(current["enabled"])
-
-        if new_rule_type not in {"injection", "category", "severity"}:
-            raise ValueError("Invalid rule_type")
-        if not new_match:
-            raise ValueError("match is required")
-        if new_action not in {"ALLOW", "REDACT", "BLOCK"}:
-            raise ValueError("Invalid action")
-
-        conn.execute(
-            """
-            UPDATE tenant_policies
-            SET rule_type = ?, match = ?, action = ?, enabled = ?, updated_at = ?
-            WHERE id = ? AND tenant_id = ?
-            """,
-            (new_rule_type, new_match, new_action, new_enabled, _utcnow_iso(), int(rule_id), int(tenant_id)),
-        )
-        row = conn.execute(
-            """
-            SELECT id, tenant_id, rule_type, match, action, enabled, created_at, updated_at
-            FROM tenant_policies
-            WHERE id = ?
-            """,
-            (int(rule_id),),
-        ).fetchone()
-    return dict(row)
-
-
-def delete_policy_rule(tenant_id: int, rule_id: int) -> bool:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "DELETE FROM tenant_policies WHERE id = ? AND tenant_id = ?",
-            (int(rule_id), int(tenant_id)),
-        )
-        return int(cur.rowcount or 0) > 0
-
-
-def has_any_admin_membership() -> bool:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(1) AS c
-            FROM memberships
-            WHERE role IN ('platform_admin', 'admin')
-            """
-        ).fetchone()
-        return bool(row and int(row["c"]) > 0)
-
-
-def bootstrap_first_run(
-    *,
-    tenant_name: str,
-    admin_external_user: str,
-    provider: str,
-    model: Optional[str],
-    api_key: Optional[str],
-    base_url: Optional[str] = None,
-) -> Dict[str, Any]:
-    if has_any_admin_membership():
-        raise ValueError("Onboarding already completed")
-
-    safe_tenant_name = (tenant_name or "").strip() or "Default Tenant"
-    safe_admin_user = (admin_external_user or "").strip()
-    if not safe_admin_user:
-        raise ValueError("admin_external_user is required")
-
-    tenant_id = create_tenant(safe_tenant_name)
-    user_id = ensure_user(safe_admin_user)
-    upsert_membership(tenant_id=tenant_id, user_id=int(user_id), role=PLATFORM_ADMIN_ROLE)
-    provider_cfg = upsert_tenant_provider_config(
-        tenant_id=tenant_id,
-        provider=provider,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-    )
-
-    try:
-        write_audit_log(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            action="onboarding.completed",
-            target_type="tenant",
-            target_id=str(tenant_id),
-            metadata={
-                "tenant_name": safe_tenant_name,
-                "admin_external_user": safe_admin_user,
-                "provider": provider_cfg["provider"],
-                "model": provider_cfg["model"],
-                "base_url": provider_cfg.get("base_url"),
-                "api_key_tail": provider_cfg["api_key_tail"],
-            },
-        )
-    except Exception:
-        pass
-
-    return {
-        "ok": True,
-        "tenant_id": int(tenant_id),
-        "tenant_name": safe_tenant_name,
-        "admin_external_user": safe_admin_user,
-        "provider": provider_cfg,
-    }
-
-
-def get_role(tenant_id: int, user_id: Optional[int]) -> str:
-    if not user_id:
-        return "user"
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT role FROM memberships WHERE tenant_id = ? AND user_id = ?",
-            (tenant_id, user_id),
-        )
-        row = cur.fetchone()
-        return _normalize_role_name(str(row["role"])) if row else "user"
-
-
-def upsert_membership(tenant_id: int, user_id: int, role: str) -> None:
-    role_name = _normalize_role_name(role)
-    if role_name not in ("platform_admin", "admin", "auditor", "user", "tenant_admin", "employee"):
-        raise ValueError("Invalid role")
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO memberships (tenant_id, user_id, role)
-            VALUES (?, ?, ?)
-            ON CONFLICT(tenant_id, user_id) DO UPDATE SET role = excluded.role
-            """,
-            (tenant_id, user_id, role_name),
-        )
-
-
-def list_memberships(tenant_id: int) -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT m.tenant_id, m.user_id, u.external_id, u.display_name, m.role, m.created_at
-            FROM memberships m
-            JOIN users u ON u.id = m.user_id
-            WHERE m.tenant_id = ?
-            ORDER BY u.external_id ASC
-            """,
-            (tenant_id,),
-        ).fetchall()
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["role"] = _normalize_role_name(str(item.get("role") or ""))
-            out.append(item)
-        return out
-
-
-def get_user_by_external_id(external_id: str) -> Optional[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT id, external_id, display_name, created_at FROM users WHERE external_id = ?",
-            (external_id,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-
-def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            SELECT id, external_id, username, display_name, password_hash, password_salt, is_active, created_at
-            FROM users
-            WHERE username = ?
-            """,
-            ((username or "").strip(),),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-
-def list_users(limit: int = 200) -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    cap = max(1, min(int(limit), 1000))
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, external_id, username, display_name, is_active, created_at
-            FROM users
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (cap,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def create_auth_user(
-    *,
-    username: str,
-    password: str,
-    display_name: Optional[str] = None,
-    external_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    uname = (username or "").strip()
-    if not uname:
-        raise ValueError("username is required")
-    if get_user_by_username(uname):
-        raise ValueError("username already exists")
-
-    pw = make_password_hash(password)
-    ext = (external_id or uname).strip() or uname
-    name = (display_name or uname).strip() or uname
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT id FROM users WHERE external_id = ?",
-            (ext,),
-        ).fetchone()
-        if existing:
-            user_id = int(existing["id"])
-            conn.execute(
-                """
-                UPDATE users
-                SET username = ?, display_name = ?, password_hash = ?, password_salt = ?, is_active = 1
-                WHERE id = ?
-                """,
-                (uname, name, pw["password_hash"], pw["password_salt"], user_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                INSERT INTO users (external_id, username, display_name, password_hash, password_salt, is_active)
-                VALUES (?, ?, ?, ?, ?, 1)
-                """,
-                (ext, uname, name, pw["password_hash"], pw["password_salt"]),
-            )
-            user_id = int(cur.lastrowid)
-    row = get_user_by_username(uname)
-    return {
-        "id": user_id,
-        "external_id": row.get("external_id") if row else ext,
-        "username": uname,
-        "display_name": name,
-        "is_active": True,
-    }
-
-
-def set_user_password(user_id: int, new_password: str) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    password_pack = make_password_hash(new_password)
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE users
-            SET password_hash = ?, password_salt = ?, is_active = 1
-            WHERE id = ?
-            """,
-            (password_pack["password_hash"], password_pack["password_salt"], int(user_id)),
-        )
-        row = conn.execute(
-            "SELECT id, external_id, username, display_name, is_active, created_at FROM users WHERE id = ?",
-            (int(user_id),),
-        ).fetchone()
-    if not row:
-        raise ValueError("user not found")
-    return dict(row)
-
-
-def verify_user_credentials(username: str, password: str) -> Optional[Dict[str, Any]]:
-    row = get_user_by_username((username or "").strip())
-    if not row:
-        return None
-    if int(row.get("is_active", 0) or 0) != 1:
-        return None
-    if not verify_password(password, str(row.get("password_hash") or ""), str(row.get("password_salt") or "")):
-        return None
+    session.add(row)
+    session.flush()
     return row
 
 
+def get_tenant_usage_daily(tenant_id: int, day: Optional[str] = None) -> Dict[str, Any]:
+    ensure_enterprise_schema()
+    day_val = day or _now_dt().strftime("%Y-%m-%d")
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        row = _ensure_usage_row(session, tenant_id, day_val)
+        return _model_to_dict(row)
+
+
+def increment_tenant_usage_daily(
+    tenant_id: int,
+    *,
+    day: Optional[str] = None,
+    request_delta: int = 1,
+    token_delta: int = 0,
+    blocked: bool = False,
+    risk_delta: int = 0,
+) -> None:
+    ensure_enterprise_schema()
+    day_val = day or _now_dt().strftime("%Y-%m-%d")
+    req_delta = max(0, int(request_delta))
+    tok_delta = max(0, int(token_delta))
+    blk_delta = 1 if blocked else 0
+    risk_delta = int(risk_delta)
+
+    with get_session() as session:
+        values = {
+            "tenant_id": int(tenant_id),
+            "day": day_val,
+            "request_count": req_delta,
+            "token_count": tok_delta,
+            "blocked_count": blk_delta,
+            "risk_sum": risk_delta,
+        }
+        stmt = _dialect_insert(TenantUsageDaily).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[TenantUsageDaily.tenant_id, TenantUsageDaily.day],
+            set_={
+                "request_count": TenantUsageDaily.request_count + req_delta,
+                "token_count": TenantUsageDaily.token_count + tok_delta,
+                "blocked_count": TenantUsageDaily.blocked_count + blk_delta,
+                "risk_sum": TenantUsageDaily.risk_sum + risk_delta,
+                "updated_at": func.now(),
+            },
+        )
+        session.execute(stmt)
+
+
+# --------------------------------------------------------------------------- #
+# Audit logging
+# --------------------------------------------------------------------------- #
+
 def write_audit_log(
+    *,
     tenant_id: int,
     user_id: Optional[int],
     action: str,
@@ -1882,449 +789,122 @@ def write_audit_log(
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
     request_id: Optional[str] = None,
-) -> None:
+    chain_id: Optional[str] = None,
+    signing_key: Optional[str] = None,
+) -> int:
     ensure_enterprise_schema()
-    signing_key = os.getenv("AUDIT_SIGNING_KEY", "").strip() or DEFAULT_AUDIT_SIGNING_KEY
-    metadata_json = _canonical_json(redact_secrets(metadata or {}))
+    payload = {
+        "action": action,
+        "target_type": target_type,
+        "target_id": target_id,
+        "metadata": metadata or {},
+        "ip": ip,
+        "user_agent": user_agent,
+        "request_id": request_id,
+    }
+    chain_val = chain_id or request_id or str(uuid.uuid4())
+    signing = signing_key or os.getenv("AUDIT_SIGNING_KEY", DEFAULT_AUDIT_SIGNING_KEY)
 
-    with get_conn() as conn:
-        last_row = conn.execute(
-            """
-            SELECT id, row_hash, chain_id
-            FROM audit_logs
-            WHERE tenant_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (tenant_id,),
-        ).fetchone()
-
-        prev_hash = str(last_row["row_hash"]) if last_row and last_row["row_hash"] else ""
-        chain_id = str(last_row["chain_id"]) if last_row and last_row["chain_id"] else f"tenant-{tenant_id}"
-        created_at = _utcnow_iso()
-
-        payload = {
-            "tenant_id": int(tenant_id),
-            "user_id": user_id,
-            "action": action,
-            "target_type": target_type,
-            "target_id": target_id,
-            "metadata_json": metadata_json,
-            "ip": ip,
-            "user_agent": user_agent,
-            "request_id": request_id,
-            "created_at": created_at,
-            "chain_id": chain_id,
-        }
-        row_hash = compute_row_hash(payload, prev_hash=prev_hash, signing_key=signing_key)
-
-        conn.execute(
-            """
-            INSERT INTO audit_logs
-              (tenant_id, user_id, action, target_type, target_id, metadata_json, ip, user_agent, request_id, prev_hash, row_hash, chain_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                tenant_id,
-                user_id,
-                action,
-                target_type,
-                target_id,
-                metadata_json,
-                ip,
-                user_agent,
-                request_id,
-                prev_hash,
-                row_hash,
-                chain_id,
-                created_at,
-            ),
+    with get_session() as session:
+        prev = session.execute(
+            select(AuditLog)
+            .where(and_(AuditLog.tenant_id == int(tenant_id), AuditLog.chain_id == chain_val))
+            .order_by(AuditLog.id.desc())
+        ).scalar_one_or_none()
+        prev_hash = prev.row_hash if prev else ""
+        row_hash = compute_row_hash(payload, prev_hash, signing)
+        log = AuditLog(
+            tenant_id=int(tenant_id),
+            user_id=int(user_id) if user_id is not None else None,
+            action=str(action),
+            target_type=target_type,
+            target_id=target_id,
+            metadata_json=_canonical_json(metadata or {}),
+            ip=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            prev_hash=prev_hash or None,
+            row_hash=row_hash,
+            chain_id=chain_val,
         )
+        session.add(log)
+        session.flush()
+        return int(log.id)
 
 
-def list_audit_logs(tenant_id: int, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    limit = max(1, min(int(limit), 1000))
-    offset = max(0, int(offset))
-
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-              id, tenant_id, user_id, action, target_type, target_id,
-              metadata_json, ip, user_agent, request_id, prev_hash, row_hash, chain_id, created_at
-            FROM audit_logs
-            WHERE tenant_id = ?
-            ORDER BY id DESC
-            LIMIT ? OFFSET ?
-            """,
-            (tenant_id, limit, offset),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def verify_audit_chain(tenant_id: int, limit: Optional[int] = 500) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    signing_key = os.getenv("AUDIT_SIGNING_KEY", "").strip() or DEFAULT_AUDIT_SIGNING_KEY
-
-    with get_conn() as conn:
-        if limit is None:
-            rows = conn.execute(
-                """
-                SELECT id, tenant_id, user_id, action, target_type, target_id, metadata_json,
-                       ip, user_agent, request_id, prev_hash, row_hash, chain_id, created_at
-                FROM audit_logs
-                WHERE tenant_id = ?
-                ORDER BY id ASC
-                """,
-                (tenant_id,),
-            ).fetchall()
-        else:
-            limit = max(1, min(int(limit), 5000))
-            rows = conn.execute(
-                """
-                SELECT id, tenant_id, user_id, action, target_type, target_id, metadata_json,
-                       ip, user_agent, request_id, prev_hash, row_hash, chain_id, created_at
-                FROM audit_logs
-                WHERE tenant_id = ?
-                  AND id IN (
-                    SELECT id FROM audit_logs
-                    WHERE tenant_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                  )
-                ORDER BY id ASC
-                """,
-                (tenant_id, tenant_id, limit),
-            ).fetchall()
-
-        if not rows:
-            return {"ok": True, "tenant_id": tenant_id, "checked": 0, "limit": limit}
-
-        first_id = int(rows[0]["id"])
-        prev_row = conn.execute(
-            "SELECT row_hash FROM audit_logs WHERE tenant_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
-            (tenant_id, first_id),
-        ).fetchone()
-        expected_prev_hash = str(prev_row["row_hash"]) if prev_row and prev_row["row_hash"] else ""
-
-        checked = 0
-        for row in rows:
-            row_id = int(row["id"])
-            actual_prev = row["prev_hash"] or ""
-            if actual_prev != expected_prev_hash:
-                return {
-                    "ok": False,
-                    "tenant_id": tenant_id,
-                    "checked": checked,
-                    "first_bad_id": row_id,
-                    "reason": "prev_hash_mismatch",
-                    "limit": limit,
-                }
-
-            payload = {
-                "tenant_id": int(row["tenant_id"]),
-                "user_id": row["user_id"],
-                "action": row["action"],
-                "target_type": row["target_type"],
-                "target_id": row["target_id"],
-                "metadata_json": row["metadata_json"] or "{}",
-                "ip": row["ip"],
-                "user_agent": row["user_agent"],
-                "request_id": row["request_id"],
-                "created_at": row["created_at"],
-                "chain_id": row["chain_id"] or f"tenant-{tenant_id}",
-            }
-            expected_hash = compute_row_hash(
-                payload=payload,
-                prev_hash=expected_prev_hash,
-                signing_key=signing_key,
-            )
-            actual_hash = row["row_hash"] or ""
-            if actual_hash != expected_hash:
-                return {
-                    "ok": False,
-                    "tenant_id": tenant_id,
-                    "checked": checked,
-                    "first_bad_id": row_id,
-                    "reason": "row_hash_mismatch",
-                    "limit": limit,
-                }
-
-            expected_prev_hash = actual_hash
-            checked += 1
-
-        return {"ok": True, "tenant_id": tenant_id, "checked": checked, "limit": limit}
-
-
-def get_tenant_limits(tenant_id: int) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT tenant_id, daily_requests_limit, rpm_limit, enabled
-            FROM tenant_limits
-            WHERE tenant_id = ?
-            """,
-            (tenant_id,),
-        ).fetchone()
-        if not row:
-            conn.execute(
-                """
-                INSERT INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, enabled)
-                VALUES (?, ?, ?, 1)
-                """,
-                (tenant_id, DEFAULT_DAILY_REQUESTS_LIMIT, DEFAULT_RPM_LIMIT),
-            )
-            row = conn.execute(
-                """
-                SELECT tenant_id, daily_requests_limit, rpm_limit, enabled
-                FROM tenant_limits
-                WHERE tenant_id = ?
-                """,
-                (tenant_id,),
-            ).fetchone()
-        return {
-            "tenant_id": int(row["tenant_id"]),
-            "daily_requests_limit": int(row["daily_requests_limit"]),
-            "rpm_limit": int(row["rpm_limit"]),
-            "enabled": bool(int(row["enabled"])),
-        }
-
-
-def upsert_tenant_limits(
-    tenant_id: int,
-    daily_requests_limit: Optional[int] = None,
-    rpm_limit: Optional[int] = None,
-    enabled: Optional[bool] = None,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    current = get_tenant_limits(tenant_id)
-    daily_requests_limit = (
-        int(daily_requests_limit) if daily_requests_limit is not None else current["daily_requests_limit"]
-    )
-    rpm_limit = int(rpm_limit) if rpm_limit is not None else current["rpm_limit"]
-    enabled_int = int(enabled) if enabled is not None else int(current["enabled"])
-
-    if daily_requests_limit < 1:
-        raise ValueError("daily_requests_limit must be >= 1")
-    if rpm_limit < 1:
-        raise ValueError("rpm_limit must be >= 1")
-
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, enabled)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(tenant_id) DO UPDATE SET
-              daily_requests_limit = excluded.daily_requests_limit,
-              rpm_limit = excluded.rpm_limit,
-              enabled = excluded.enabled
-            """,
-            (tenant_id, daily_requests_limit, rpm_limit, enabled_int),
-        )
-    return get_tenant_limits(tenant_id)
-
-
-def increment_tenant_usage_daily(
-    tenant_id: int,
-    blocked: bool = False,
-    risk_delta: int = 0,
-    token_delta: int = 0,
-    request_delta: int = 1,
-    day: Optional[str] = None,
-) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    if day is None:
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    request_delta = max(0, int(request_delta))
-    blocked_delta = 1 if blocked else 0
-    updated_at = _utcnow_iso()
-
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO tenant_usage_daily (
-              tenant_id, day, request_count, token_count, blocked_count, risk_sum, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id, day) DO UPDATE SET
-              request_count = tenant_usage_daily.request_count + excluded.request_count,
-              token_count = tenant_usage_daily.token_count + excluded.token_count,
-              blocked_count = tenant_usage_daily.blocked_count + excluded.blocked_count,
-              risk_sum = tenant_usage_daily.risk_sum + excluded.risk_sum,
-              updated_at = excluded.updated_at
-            """,
-            (tenant_id, day, request_delta, int(token_delta), blocked_delta, int(risk_delta), updated_at),
-        )
-        row = conn.execute(
-            """
-            SELECT tenant_id, day, request_count, token_count, blocked_count, risk_sum, updated_at
-            FROM tenant_usage_daily
-            WHERE tenant_id = ? AND day = ?
-            """,
-            (tenant_id, day),
-        ).fetchone()
-        return dict(row)
-
-
-def get_tenant_usage_daily(tenant_id: int, day: Optional[str] = None) -> Dict[str, Any]:
-    ensure_enterprise_schema()
-    if day is None:
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT tenant_id, day, request_count, token_count, blocked_count, risk_sum, updated_at
-            FROM tenant_usage_daily
-            WHERE tenant_id = ? AND day = ?
-            """,
-            (tenant_id, day),
-        ).fetchone()
-        if not row:
-            return {
-                "tenant_id": int(tenant_id),
-                "day": day,
-                "request_count": 0,
-                "token_count": 0,
-                "blocked_count": 0,
-                "risk_sum": 0,
-                "updated_at": "",
-            }
-        return dict(row)
-
-
-def create_job(
-    tenant_id: int,
-    user_id: Optional[int],
-    job_type: str,
-    input_payload: Optional[Dict[str, Any]] = None,
-) -> str:
-    ensure_enterprise_schema()
-    job_id = str(uuid.uuid4())
-    now = _utcnow_iso()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs (id, tenant_id, user_id, type, status, input_json, output_path, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, ?)
-            """,
-            (
-                job_id,
-                tenant_id,
-                user_id,
-                job_type,
-                _canonical_json(input_payload or {}),
-                now,
-                now,
-            ),
-        )
-    return job_id
-
-
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT id, tenant_id, user_id, type, status, input_json, output_path, error, created_at, updated_at
-            FROM jobs
-            WHERE id = ?
-            """,
-            (job_id,),
-        ).fetchone()
-        return dict(row) if row else None
-
+# --------------------------------------------------------------------------- #
+# Jobs
+# --------------------------------------------------------------------------- #
 
 def claim_next_job(job_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        if job_type:
-            row = conn.execute(
-                """
-                SELECT id
-                FROM jobs
-                WHERE status = 'queued' AND type = ?
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-                (job_type,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                """
-                SELECT id
-                FROM jobs
-                WHERE status = 'queued'
-                ORDER BY created_at ASC
-                LIMIT 1
-                """
-            ).fetchone()
-        if not row:
-            conn.execute("COMMIT")
-            return None
+    """Atomically claim the oldest queued job (skip locked on Postgres)."""
 
-        job_id = row["id"]
-        now = _utcnow_iso()
-        conn.execute(
-            "UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'queued'",
-            (now, job_id),
-        )
-        claimed = conn.execute(
-            """
-            SELECT id, tenant_id, user_id, type, status, input_json, output_path, error, created_at, updated_at
-            FROM jobs
-            WHERE id = ?
-            """,
-            (job_id,),
-        ).fetchone()
-        conn.execute("COMMIT")
-        return dict(claimed) if claimed else None
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        conn.close()
+    ensure_enterprise_schema()
+    with get_session() as session:
+        query = select(Job).where(Job.status == "queued")
+        if job_type:
+            query = query.where(Job.type == job_type)
+        if engine.dialect.name == "postgresql":
+            query = query.order_by(Job.created_at).with_for_update(skip_locked=True)
+        else:
+            query = query.order_by(Job.created_at)
+        job = session.execute(query.limit(1)).scalar_one_or_none()
+        if not job:
+            return None
+        job.status = "running"
+        job.updated_at = func.now()
+        session.flush()
+        return _model_to_dict(job)
 
 
 def update_job(
+    *,
     job_id: str,
-    status: str,
+    status: Optional[str] = None,
     output_path: Optional[str] = None,
     error: Optional[str] = None,
-) -> None:
-    if status not in ("queued", "running", "done", "failed"):
-        raise ValueError("Invalid job status")
+) -> Optional[Dict[str, Any]]:
     ensure_enterprise_schema()
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE jobs
-            SET status = ?, output_path = ?, error = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (status, output_path, error, _utcnow_iso(), job_id),
-        )
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        if not job:
+            return None
+        if status:
+            job.status = status
+        job.output_path = output_path
+        job.error = error
+        job.updated_at = func.now()
+        session.flush()
+        return _model_to_dict(job)
 
 
-def list_jobs(tenant_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    ensure_enterprise_schema()
-    limit = max(1, min(int(limit), 1000))
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, tenant_id, user_id, type, status, input_json, output_path, error, created_at, updated_at
-            FROM jobs
-            WHERE tenant_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (tenant_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+# --------------------------------------------------------------------------- #
+# Request logging (enterprise parity)
+# --------------------------------------------------------------------------- #
+
+def insert_request(row: Dict[str, Any], tenant_id: int) -> None:
+    values = {
+        "id": row.get("id"),
+        "ts": row.get("ts") or _utcnow_iso(),
+        "user": row.get("user"),
+        "purpose": row.get("purpose"),
+        "model": row.get("model"),
+        "provider": row.get("provider"),
+        "cleaned_prompt_preview": row.get("cleaned_prompt_preview"),
+        "prompt_original_preview": row.get("prompt_original_preview"),
+        "prompt_sent_to_ai_preview": row.get("prompt_sent_to_ai_preview"),
+        "detections_count": row.get("detections_count"),
+        "entity_counts_json": row.get("entity_counts_json"),
+        "risk_categories_json": row.get("risk_categories_json"),
+        "risk_score": row.get("risk_score"),
+        "risk_level": row.get("risk_level"),
+        "severity": row.get("severity") or row.get("risk_level"),
+        "decision": row.get("decision"),
+        "injection_detected": int(row.get("injection_detected", 0) or 0),
+        "tenant_id": int(tenant_id),
+    }
+    with get_session() as session:
+        stmt = _dialect_insert(Request).values(**values)
+        stmt = stmt.on_conflict_do_update(index_elements=[Request.id], set_=values)
+        session.execute(stmt)
+

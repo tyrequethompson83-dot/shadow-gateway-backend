@@ -1,0 +1,44 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      AUTH_MODE: ${AUTH_MODE:-jwt}
+      DB_PATH: /data/app.db
+      LOG_DIR: /data/logs
+      MIGRATIONS_DIR: /app/migrations
+    ports:
+      - "8080:8080"
+    volumes:
+      - shadow_data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').getcode()==200 else 1)
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  product:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8080
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  shadow_data:

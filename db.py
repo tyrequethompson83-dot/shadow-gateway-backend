@@ -1,307 +1,329 @@
+"""
+Database access layer for core (non‑enterprise) features.
+
+Primary target is Postgres when `DATABASE_URL` is set. Falls back to a local
+SQLite file for convenience during local development and tests.
+
+All queries return dictionaries to make the call sites serialization‑friendly.
+"""
+
 import json
 import os
-import sqlite3
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional
 
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-except Exception:  # psycopg2 may be absent in pure SQLite mode
-    psycopg2 = None
-    RealDictCursor = None
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Text,
+    Index,
+    case,
+    create_engine,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Minimal DB helpers with Postgres first, falling back to SQLite.
+# --------------------------------------------------------------------------- #
+# Engine / session configuration
+# --------------------------------------------------------------------------- #
+
 DB_PATH = os.getenv("DB_PATH", "app.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
-def _conn():
-    if DATABASE_URL and psycopg2:
-        pg_conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        pg_conn.autocommit = True
+def _database_url() -> str:
+    """Prefer DATABASE_URL (Postgres); otherwise use local SQLite."""
 
-        class PGWrapper:
-            def __init__(self, conn):
-                self.conn = conn
-
-            def execute(self, sql: str, params: Any = None):
-                # Translate SQLite-style ? placeholders to %s for psycopg2
-                translated = sql.replace("?", "%s")
-                cur = self.conn.cursor()
-                cur.execute(translated, params or [])
-                return cur
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                self.conn.close()
-
-        return PGWrapper(pg_conn)
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DATABASE_URL or f"sqlite:///{DB_PATH}"
 
 
-def _request_columns(con: sqlite3.Connection) -> List[str]:
-    rows = con.execute("PRAGMA table_info(requests)").fetchall()
-    return [r[1] for r in rows]
+engine: Engine = create_engine(_database_url(), future=True, echo=False)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False,
+    future=True,
+)
+Base = declarative_base()
 
 
-def _request_ts_column(cols: List[str]) -> Optional[str]:
-    if "created_at" in cols:
-        return "created_at"
-    if "ts" in cols:
-        return "ts"
-    return None
+# --------------------------------------------------------------------------- #
+# ORM models
+# --------------------------------------------------------------------------- #
+
+class Request(Base):
+    """Requests table mapped for SQLAlchemy with multi‑tenant indexes."""
+
+    __tablename__ = "requests"
+
+    id = Column(String, primary_key=True)
+    ts = Column(String)
+    user = Column(String)
+    purpose = Column(String)
+    model = Column(String)
+    provider = Column(String)
+    cleaned_prompt_preview = Column(Text)
+    prompt_original_preview = Column(Text)
+    prompt_sent_to_ai_preview = Column(Text)
+    detections_count = Column(Integer)
+    entity_counts_json = Column(Text)
+    risk_categories_json = Column(Text)
+    risk_score = Column(Integer)
+    risk_level = Column(String)
+    severity = Column(String)
+    decision = Column(String)
+    injection_detected = Column(Integer, default=0)
+    tenant_id = Column(Integer, default=1)
+
+    __table_args__ = (
+        Index("idx_requests_tenant_created", "tenant_id", "ts"),
+        Index("idx_requests_tenant_decision", "tenant_id", "decision"),
+        Index("idx_requests_tenant_provider", "tenant_id", "provider"),
+    )
 
 
-def init_db():
-    """
-    Create `requests` table and run additive tenant migration steps:
-    - add tenant_id column if missing
-    - backfill tenant_id to 1
-    - create tenant/time index
-    """
-    with _conn() as con:
-        con.execute(
+class Tenant(Base):
+    """Minimal tenant mapping used by dashboard helpers."""
+
+    __tablename__ = "tenants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    created_at = Column(String, server_default=func.now())
+
+
+# --------------------------------------------------------------------------- #
+# Session / connection helpers
+# --------------------------------------------------------------------------- #
+
+def get_engine() -> Engine:
+    """Expose the shared engine for callers that need low‑level access."""
+
+    return engine
+
+
+@contextmanager
+def get_session():
+    """Context manager that yields a SQLAlchemy session with safe commit/rollback."""
+
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def init_db() -> None:
+    """Create tables and indexes if they do not exist."""
+
+    Base.metadata.create_all(bind=engine)
+
+
+# --------------------------------------------------------------------------- #
+# Metadata helpers (information_schema for Postgres; inspector for SQLite)
+# --------------------------------------------------------------------------- #
+
+def table_exists(table_name: str, *, schema: str = "public") -> bool:
+    """Check table existence without using SQLite‑specific sqlite_master/PRAGMA."""
+
+    if engine.dialect.name == "postgresql":
+        query = text(
             """
-            CREATE TABLE IF NOT EXISTS requests (
-                id TEXT PRIMARY KEY,
-                ts TEXT,
-                user TEXT,
-                purpose TEXT,
-                model TEXT,
-                provider TEXT,
-                cleaned_prompt_preview TEXT,
-                prompt_original_preview TEXT,
-                prompt_sent_to_ai_preview TEXT,
-                detections_count INTEGER,
-                entity_counts_json TEXT,
-                risk_categories_json TEXT,
-                risk_score INTEGER,
-                risk_level TEXT,
-                severity TEXT,
-                decision TEXT,
-                injection_detected INTEGER DEFAULT 0,
-                tenant_id INTEGER
-            )
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = :schema AND table_name = :table
+            LIMIT 1
             """
         )
+        with engine.connect() as conn:
+            row = conn.execute(query, {"schema": schema, "table": table_name}).first()
+            return bool(row)
 
-        cols = _request_columns(con)
-        if "tenant_id" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN tenant_id INTEGER")
-            cols = _request_columns(con)
-        if "provider" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN provider TEXT")
-            cols = _request_columns(con)
-        if "risk_categories_json" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN risk_categories_json TEXT")
-            cols = _request_columns(con)
-        if "prompt_original_preview" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN prompt_original_preview TEXT")
-            cols = _request_columns(con)
-        if "prompt_sent_to_ai_preview" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN prompt_sent_to_ai_preview TEXT")
-            cols = _request_columns(con)
-        if "severity" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN severity TEXT")
-            cols = _request_columns(con)
-        if "injection_detected" not in cols:
-            con.execute("ALTER TABLE requests ADD COLUMN injection_detected INTEGER DEFAULT 0")
-            cols = _request_columns(con)
+    # Fallback for SQLite/local dev uses SQLAlchemy's inspector (no raw PRAGMA here)
+    from sqlalchemy import inspect  # imported lazily to avoid unused warning on Postgres
 
-        con.execute("UPDATE requests SET tenant_id = 1 WHERE tenant_id IS NULL")
-        con.execute("UPDATE requests SET severity = COALESCE(severity, risk_level) WHERE severity IS NULL")
-        con.execute("UPDATE requests SET provider = COALESCE(provider, 'gemini') WHERE provider IS NULL")
-        con.execute("UPDATE requests SET injection_detected = COALESCE(injection_detected, 0) WHERE injection_detected IS NULL")
-
-        ts_col = _request_ts_column(cols)
-        if ts_col:
-            con.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_requests_tenant_created ON requests(tenant_id, {ts_col})"
-            )
-        con.execute("CREATE INDEX IF NOT EXISTS idx_requests_tenant_decision ON requests(tenant_id, decision)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_requests_tenant_provider ON requests(tenant_id, provider)")
+    inspector = inspect(engine)
+    return table_name in inspector.get_table_names()
 
 
-def insert_request(row: Dict, tenant_id: int):
-    """Insert a request row dict into the requests table with tenant scope."""
+def list_columns(table_name: str, *, schema: str = "public") -> List[str]:
+    """List columns using information_schema on Postgres; inspector elsewhere."""
+
+    if engine.dialect.name == "postgresql":
+        query = text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = :table
+            ORDER BY ordinal_position
+            """
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(query, {"schema": schema, "table": table_name}).all()
+            return [str(r[0]) for r in rows]
+
+    from sqlalchemy import inspect
+
+    inspector = inspect(engine)
+    if table_name not in inspector.get_table_names():
+        return []
+    return [c["name"] for c in inspector.get_columns(table_name)]
+
+
+# --------------------------------------------------------------------------- #
+# Utility converters
+# --------------------------------------------------------------------------- #
+
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if hasattr(row, "_mapping"):
+        return dict(row._mapping)
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _rows_to_dicts(rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    return [_row_to_dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Request upsert helper
+# --------------------------------------------------------------------------- #
+
+def _request_insert(values: Dict[str, Any]):
+    """Dialect‑aware upsert for the requests table."""
+
+    if engine.dialect.name == "postgresql":
+        stmt = pg_insert(Request).values(**values)
+    else:
+        stmt = sqlite_insert(Request).values(**values)
+    return stmt.on_conflict_do_update(index_elements=[Request.id], set_=values)
+
+
+# --------------------------------------------------------------------------- #
+# Public operations
+# --------------------------------------------------------------------------- #
+
+def insert_request(row: Dict[str, Any], tenant_id: int) -> None:
+    """Insert or update a request row scoped to a tenant."""
+
     init_db()
-    with _conn() as con:
-        cols = _request_columns(con)
-        if "tenant_id" in cols:
-            con.execute(
-                """
-                INSERT OR REPLACE INTO requests
-                    (id, ts, user, purpose, model, provider, cleaned_prompt_preview, prompt_original_preview, prompt_sent_to_ai_preview, detections_count, entity_counts_json, risk_categories_json, risk_score, risk_level, severity, decision, injection_detected, tenant_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row.get("id"),
-                    row.get("ts"),
-                    row.get("user"),
-                    row.get("purpose"),
-                    row.get("model"),
-                    row.get("provider"),
-                    row.get("cleaned_prompt_preview"),
-                    row.get("prompt_original_preview"),
-                    row.get("prompt_sent_to_ai_preview"),
-                    row.get("detections_count"),
-                    row.get("entity_counts_json"),
-                    row.get("risk_categories_json"),
-                    row.get("risk_score"),
-                    row.get("risk_level"),
-                    row.get("severity"),
-                    row.get("decision"),
-                    int(row.get("injection_detected", 0) or 0),
-                    int(tenant_id),
-                ),
-            )
-        else:
-            # Fallback for pre-migration databases.
-            con.execute(
-                """
-                INSERT OR REPLACE INTO requests
-                    (id, ts, user, purpose, model, cleaned_prompt_preview, detections_count, entity_counts_json, risk_score, risk_level, decision)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row.get("id"),
-                    row.get("ts"),
-                    row.get("user"),
-                    row.get("purpose"),
-                    row.get("model"),
-                    row.get("cleaned_prompt_preview"),
-                    row.get("detections_count"),
-                    row.get("entity_counts_json"),
-                    row.get("risk_score"),
-                    row.get("risk_level"),
-                    row.get("decision"),
-                ),
-            )
+    values = {
+        "id": row.get("id"),
+        "ts": row.get("ts"),
+        "user": row.get("user"),
+        "purpose": row.get("purpose"),
+        "model": row.get("model"),
+        "provider": row.get("provider"),
+        "cleaned_prompt_preview": row.get("cleaned_prompt_preview"),
+        "prompt_original_preview": row.get("prompt_original_preview"),
+        "prompt_sent_to_ai_preview": row.get("prompt_sent_to_ai_preview"),
+        "detections_count": row.get("detections_count"),
+        "entity_counts_json": row.get("entity_counts_json"),
+        "risk_categories_json": row.get("risk_categories_json"),
+        "risk_score": row.get("risk_score"),
+        "risk_level": row.get("risk_level"),
+        "severity": row.get("severity") or row.get("risk_level"),
+        "decision": row.get("decision"),
+        "injection_detected": int(row.get("injection_detected", 0) or 0),
+        "tenant_id": int(tenant_id),
+    }
+    with get_session() as session:
+        session.execute(_request_insert(values))
 
 
 def get_summary(tenant_id: Optional[int] = None) -> Dict[str, Optional[int]]:
-    """Return request summary stats, optionally tenant-scoped."""
+    """Return aggregate stats for all requests or a single tenant."""
+
     init_db()
-    with _conn() as con:
-        cols = _request_columns(con)
-        has_tenant = "tenant_id" in cols
+    with get_session() as session:
+        filters = []
+        if tenant_id is not None:
+            filters.append(Request.tenant_id == int(tenant_id))
 
-        if has_tenant and tenant_id is not None:
-            params = (int(tenant_id),)
-            total = con.execute(
-                "SELECT COUNT(1) AS c FROM requests WHERE tenant_id = ?",
-                params,
-            ).fetchone()["c"]
-            avg_row = con.execute(
-                "SELECT AVG(risk_score) AS avg FROM requests WHERE tenant_id = ?",
-                params,
-            ).fetchone()
-            hc_row = con.execute(
-                """
-                SELECT SUM(CASE WHEN UPPER(COALESCE(risk_level, '')) IN ('HIGH', 'CRITICAL') THEN 1 ELSE 0 END) AS hc
-                FROM requests
-                WHERE tenant_id = ?
-                """,
-                params,
-            ).fetchone()
-        else:
-            total = con.execute("SELECT COUNT(1) AS c FROM requests").fetchone()["c"]
-            avg_row = con.execute("SELECT AVG(risk_score) AS avg FROM requests").fetchone()
-            hc_row = con.execute(
-                """
-                SELECT SUM(CASE WHEN UPPER(COALESCE(risk_level, '')) IN ('HIGH', 'CRITICAL') THEN 1 ELSE 0 END) AS hc
-                FROM requests
-                """
-            ).fetchone()
+        total = session.execute(select(func.count(Request.id)).where(*filters)).scalar_one()
+        avg_val = session.execute(select(func.avg(Request.risk_score)).where(*filters)).scalar()
+        high_or_critical = session.execute(
+            select(
+                func.sum(
+                    case(
+                        (Request.risk_level.in_(["HIGH", "CRITICAL"]), 1),
+                        else_=0,
+                    )
+                )
+            ).where(*filters)
+        ).scalar()
 
-    avg = avg_row["avg"] if avg_row and avg_row["avg"] is not None else 0
-    high_or_critical = hc_row["hc"] if hc_row and hc_row["hc"] is not None else 0
     return {
-        "total_requests": int(total),
-        "avg_risk_score": float(avg),
-        "high_or_critical": int(high_or_critical),
+        "total_requests": int(total or 0),
+        "avg_risk_score": float(avg_val or 0.0),
+        "high_or_critical": int(high_or_critical or 0),
     }
 
 
 def get_entity_totals(tenant_id: int = 1) -> Dict[str, int]:
-    """Sums entity_counts_json for a single tenant."""
+    """Aggregate entity counts for a tenant."""
+
     init_db()
     totals = Counter()
-    with _conn() as con:
-        cols = _request_columns(con)
-        has_tenant = "tenant_id" in cols
-        if has_tenant:
-            rows = con.execute(
-                "SELECT entity_counts_json FROM requests WHERE tenant_id = ?",
-                (int(tenant_id),),
-            ).fetchall()
-        else:
-            rows = con.execute("SELECT entity_counts_json FROM requests").fetchall()
-
-        for r in rows:
-            raw = r["entity_counts_json"]
-            if not raw:
-                continue
-            try:
-                totals.update(json.loads(raw))
-            except Exception:
-                continue
+    with get_session() as session:
+        rows = session.execute(
+            select(Request.entity_counts_json).where(Request.tenant_id == int(tenant_id))
+        ).all()
+    for raw_json, in rows:
+        if not raw_json:
+            continue
+        try:
+            totals.update(json.loads(raw_json))
+        except Exception:
+            continue
     return dict(totals)
 
 
-def get_risk_trend(tenant_id: int = 1, days: int = 14) -> List[Dict]:
-    """
-    Returns rows for plotting:
-    [{"date":"2026-03-03","avg_risk":23.5,"count":12}, ...]
-    """
-    init_db()
-    with _conn() as con:
-        cols = _request_columns(con)
-        has_tenant = "tenant_id" in cols
-        if has_tenant:
-            rows = con.execute(
-                """
-                SELECT ts, risk_score
-                FROM requests
-                WHERE tenant_id = ?
-                ORDER BY ts DESC
-                LIMIT 5000
-                """,
-                (int(tenant_id),),
-            ).fetchall()
-        else:
-            rows = con.execute(
-                """
-                SELECT ts, risk_score
-                FROM requests
-                ORDER BY ts DESC
-                LIMIT 5000
-                """
-            ).fetchall()
+def get_risk_trend(tenant_id: int = 1, days: int = 14) -> List[Dict[str, Any]]:
+    """Return rolling average risk per day for plotting."""
 
-    by_day = {}
-    for r in rows:
-        ts = r["ts"] or ""
-        risk = r["risk_score"]
+    init_db()
+    with get_session() as session:
+        rows = session.execute(
+            select(Request.ts, Request.risk_score)
+            .where(Request.tenant_id == int(tenant_id))
+            .order_by(Request.ts.desc())
+            .limit(5000)
+        ).all()
+
+    by_day: Dict[str, Dict[str, float]] = {}
+    for ts, risk in rows:
         try:
-            day = ts[:10]
-            float(risk)
+            day = (ts or "")[:10]
+            risk_val = float(risk)
         except Exception:
             continue
-
-        if day not in by_day:
-            by_day[day] = {"sum": 0.0, "count": 0}
-        by_day[day]["sum"] += float(risk)
-        by_day[day]["count"] += 1
+        bucket = by_day.setdefault(day, {"sum": 0.0, "count": 0})
+        bucket["sum"] += risk_val
+        bucket["count"] += 1
 
     days_sorted = sorted(by_day.keys())[-days:]
-    out = []
+    out: List[Dict[str, Any]] = []
     for d in days_sorted:
         c = by_day[d]["count"]
         avg = (by_day[d]["sum"] / c) if c else 0.0
@@ -309,68 +331,68 @@ def get_risk_trend(tenant_id: int = 1, days: int = 14) -> List[Dict]:
     return out
 
 
-def get_recent_requests(tenant_id: int = 1, limit: int = 100) -> List[Dict]:
-    """Return recent requests for a single tenant."""
+def get_recent_requests(tenant_id: int = 1, limit: int = 100) -> List[Dict[str, Any]]:
+    """Return recent requests for a tenant as dictionaries."""
+
     init_db()
-    with _conn() as con:
-        cols = _request_columns(con)
-        has_tenant = "tenant_id" in cols
-        if has_tenant:
-            rows = con.execute(
-                "SELECT * FROM requests WHERE tenant_id = ? ORDER BY ts DESC LIMIT ?",
-                (int(tenant_id), int(limit)),
-            ).fetchall()
-        else:
-            rows = con.execute(
-                "SELECT * FROM requests ORDER BY ts DESC LIMIT ?",
-                (int(limit),),
-            ).fetchall()
-    return [dict(r) for r in rows]
+    cap = max(1, min(int(limit), 5000))
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(Request)
+                .where(Request.tenant_id == int(tenant_id))
+                .order_by(Request.ts.desc())
+                .limit(cap)
+            )
+            .scalars()
+            .all()
+        )
+    return [_model_to_dict(r) for r in rows]
 
 
-def list_tenants() -> List[Dict]:
-    """Return tenants for dashboard selection."""
+def list_tenants() -> List[Dict[str, Any]]:
+    """List tenants if the table exists; otherwise return a default placeholder."""
+
     init_db()
-    with _conn() as con:
-        tables = {
-            r[0]
-            for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "tenants" not in tables:
-            return [{"id": 1, "name": "Default Tenant"}]
-        rows = con.execute("SELECT id, name FROM tenants ORDER BY id ASC").fetchall()
-        out = [dict(r) for r in rows]
-        return out or [{"id": 1, "name": "Default Tenant"}]
+    if not table_exists("tenants"):
+        return [{"id": 1, "name": "Default Tenant"}]
+    with get_session() as session:
+        rows = session.execute(select(Tenant).order_by(Tenant.id)).scalars().all()
+    out = [_model_to_dict(r) for r in rows]
+    return out or [{"id": 1, "name": "Default Tenant"}]
 
 
-# Backward-compatible wrappers
-def get_risk_timeseries(days: int = 14, tenant_id: int = 1) -> List[Dict]:
+def get_risk_timeseries(days: int = 14, tenant_id: int = 1) -> List[Dict[str, Any]]:
     return get_risk_trend(tenant_id=tenant_id, days=days)
 
 
-def get_recent(limit: int = 100, tenant_id: Optional[int] = None) -> List[Dict]:
+def get_recent(limit: int = 100, tenant_id: Optional[int] = None) -> List[Dict[str, Any]]:
     if tenant_id is None:
         tenant_id = 1
     return get_recent_requests(tenant_id=tenant_id, limit=limit)
 
 
 def get_compliance_snapshot(tenant_id: int) -> Dict[str, Any]:
-    init_db()
-    with _conn() as con:
-        rows = con.execute(
-            """
-            SELECT
-              user, provider, model, decision, risk_level, severity, injection_detected,
-              entity_counts_json, risk_categories_json
-            FROM requests
-            WHERE tenant_id = ?
-            """,
-            (int(tenant_id),),
-        ).fetchall()
+    """Summarize decision, severity, and provider/model usage for a tenant."""
 
-    total = len(rows)
+    init_db()
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(
+                    Request.user,
+                    Request.provider,
+                    Request.model,
+                    Request.decision,
+                    Request.risk_level,
+                    Request.severity,
+                    Request.injection_detected,
+                    Request.entity_counts_json,
+                    Request.risk_categories_json,
+                ).where(Request.tenant_id == int(tenant_id))
+            ).all()
+        )
+
     decisions = Counter()
     category_totals = Counter()
     severity_totals = Counter()
@@ -380,33 +402,43 @@ def get_compliance_snapshot(tenant_id: int) -> Dict[str, Any]:
     injection_attempts = 0
 
     for row in rows:
-        decision = str(row["decision"] or "ALLOW").upper()
-        severity = str(row["severity"] or row["risk_level"] or "LOW").upper()
-        user = str(row["user"] or "unknown")
-        provider = str(row["provider"] or "unknown")
-        model = str(row["model"] or "unknown")
+        (
+            user,
+            provider,
+            model,
+            decision,
+            risk_level,
+            severity,
+            inj,
+            entity_json,
+            category_json,
+        ) = row
+        decision_val = str(decision or "ALLOW").upper()
+        severity_val = str(severity or risk_level or "LOW").upper()
+        user_val = str(user or "unknown")
+        provider_val = str(provider or "unknown")
+        model_val = str(model or "unknown")
 
-        decisions[decision] += 1
-        severity_totals[severity] += 1
-        user_totals[user] += 1
-        provider_usage[provider] += 1
-        model_usage[model] += 1
-        if int(row["injection_detected"] or 0) > 0:
+        decisions[decision_val] += 1
+        severity_totals[severity_val] += 1
+        user_totals[user_val] += 1
+        provider_usage[provider_val] += 1
+        model_usage[model_val] += 1
+        if int(inj or 0) > 0:
             injection_attempts += 1
 
-        raw_categories = row["risk_categories_json"] or "{}"
         try:
-            parsed_categories = json.loads(raw_categories)
+            parsed_categories = json.loads(category_json or "{}")
             if isinstance(parsed_categories, dict):
-                for category, count in parsed_categories.items():
-                    category_totals[str(category)] += int(count or 0)
+                for k, v in parsed_categories.items():
+                    category_totals[str(k)] += int(v or 0)
         except Exception:
             pass
 
     top_users = [{"user": u, "count": c} for u, c in user_totals.most_common(10)]
     return {
         "tenant_id": int(tenant_id),
-        "total_requests": int(total),
+        "total_requests": int(sum(decisions.values())),
         "allowed": int(decisions.get("ALLOW", 0)),
         "redacted": int(decisions.get("REDACT", 0)),
         "blocked": int(decisions.get("BLOCK", 0)),
@@ -417,3 +449,4 @@ def get_compliance_snapshot(tenant_id: int) -> Dict[str, Any]:
         "provider_usage": dict(provider_usage),
         "model_usage": dict(model_usage),
     }
+
