@@ -105,9 +105,10 @@ from db_migrate import run_migrations
 app = FastAPI(title="Shadow AI Gateway (MVP + Risk + DB)")
 
 @app.on_event("startup")
-def ensure_schema_and_run_migrations():
-    # quick patch for tenants.is_personal
+def migrate():
+    """Ensure all SQL migrations are applied on startup."""
     try:
+        # quick patch for tenants.is_personal
         with engine.begin() as conn:
             conn.execute(text("""
                 ALTER TABLE tenants
@@ -117,7 +118,7 @@ def ensure_schema_and_run_migrations():
     except Exception as e:
         print(f"Schema patch skipped: {e}")
 
-    # run full migrations folder
+    # run all migrations
     try:
         run_migrations()
     except Exception as e:

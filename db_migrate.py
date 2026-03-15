@@ -6,15 +6,25 @@ MIGRATIONS_DIR = "migrations"
 MIGRATION_TABLE = "applied_migrations"
 
 def ensure_migration_table():
+    """Create a table to track applied migrations (works in Postgres & SQLite)."""
     with engine.begin() as conn:
-        conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
-                filename TEXT PRIMARY KEY,
-                applied_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-        """))
+        if engine.dialect.name == "postgresql":
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
+                    filename TEXT PRIMARY KEY,
+                    applied_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """))
+        else:  # SQLite
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
+                    filename TEXT PRIMARY KEY,
+                    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
 def run_migrations():
+    """Run all SQL files in /migrations that haven’t been applied yet."""
     ensure_migration_table()
     files = sorted(f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql"))
 
@@ -29,11 +39,21 @@ def run_migrations():
                 continue
 
             path = os.path.join(MIGRATIONS_DIR, file)
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 sql = f.read()
+
+            # Remove SQLite PRAGMA lines if using Postgres
+            if engine.dialect.name != "sqlite":
+                lines = [line for line in sql.splitlines() if "PRAGMA" not in line.upper()]
+                sql = "\n".join(lines)
+
+            # Skip empty files
+            if sql.strip():
                 conn.execute(text(sql))
-                conn.execute(
-                    text(f"INSERT INTO {MIGRATION_TABLE} (filename) VALUES (:file)"),
-                    {"file": file}
-                )
-                print(f"Applied migration: {file}")
+
+            # Mark migration as applied
+            conn.execute(
+                text(f"INSERT INTO {MIGRATION_TABLE} (filename) VALUES (:file)"),
+                {"file": file}
+            )
+            print(f"Applied migration: {file}")
