@@ -98,7 +98,21 @@ from tools.tool_router import execute_tool_call
 from tools.web_search import WebSearchError, WEB_SEARCH_TOOL
 
 app = FastAPI(title="Shadow AI Gateway (MVP + Risk + DB)")
+from sqlalchemy import text
+from database import engine
 
+@app.on_event("startup")
+def fix_database_schema():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                ALTER TABLE tenants
+                ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT TRUE;
+            """))
+        print("tenants.is_personal ensured")
+    except Exception as e:
+        print(f"Schema patch skipped: {e}")
+        
 # Enterprise middleware (non-breaking defaults)
 app.add_middleware(TenantLimitsMiddleware)
 app.add_middleware(EnterpriseContextMiddleware)
