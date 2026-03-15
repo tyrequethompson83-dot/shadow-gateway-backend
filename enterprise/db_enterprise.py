@@ -28,6 +28,7 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     case,
+    delete,
     create_engine,
     func,
     select,
@@ -51,6 +52,7 @@ from security_utils import (
     encrypt_secret,
     is_encrypted_secret,
     mask_key_tail,
+    make_password_hash,
 )
 
 # --------------------------------------------------------------------------- #
@@ -531,6 +533,53 @@ def ensure_user(external_user: Optional[str]) -> Optional[int]:
         return int(user.id)
 
 
+def get_user_by_external_id(external_id: str) -> Optional[Dict[str, Any]]:
+    """Lookup a user by external_id (case-insensitive)."""
+
+    ensure_enterprise_schema()
+    value = (external_id or "").strip()
+    if not value:
+        return None
+    with get_session() as session:
+        row = session.execute(
+            select(User).where(func.lower(User.external_id) == func.lower(value))
+        ).scalar_one_or_none()
+        return _model_to_dict(row) if row else None
+
+
+def has_any_admin_membership() -> bool:
+    """Return True when any admin-level membership exists."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        row = (
+            session.execute(
+                select(Membership.id).where(
+                    Membership.role.in_(("platform_admin", "admin", "tenant_admin"))
+                ).limit(1)
+            )
+            .scalar_one_or_none()
+        )
+        return bool(row)
+
+
+def set_user_password(user_id: int, password: str) -> None:
+    """Set a user's password using PBKDF2 hashing (non-legacy)."""
+
+    ensure_enterprise_schema()
+    user_id_int = int(user_id)
+    hashes = make_password_hash(password)
+    with get_session() as session:
+        user = session.get(User, user_id_int)
+        if not user:
+            raise ValueError("user not found")
+        user.password_hash = hashes["password_hash"]
+        user.password_salt = hashes["password_salt"]
+        user.locked_until = None
+        user.is_active = True
+        session.flush()
+
+
 def get_role(tenant_id: int, user_id: Optional[int]) -> str:
     ensure_enterprise_schema()
     if not user_id:
@@ -676,6 +725,157 @@ def get_tenant_provider_runtime_config(tenant_id: int) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Provider key management
+# --------------------------------------------------------------------------- #
+
+def upsert_tenant_provider_config(
+    *,
+    tenant_id: int,
+    provider: str,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update the active provider config for a tenant and optionally store an API key."""
+
+    ensure_enterprise_schema()
+    provider_name = normalize_provider_name(provider)
+    model_name = validate_model_for_provider(provider_name, model)
+    base_url_clean = normalize_optional_base_url(base_url) or default_base_url_for_provider(provider_name)
+
+    tail: Optional[str] = None
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        cfg = _ensure_provider_config(session, tenant_id)
+        cfg.provider = provider_name
+        cfg.model = model_name
+        cfg.base_url = base_url_clean
+        cfg.updated_at = func.now()
+        if api_key:
+            enc = encrypt_secret(api_key)
+            tail = mask_key_tail(api_key)
+            stmt = _dialect_insert(TenantProviderKey).values(
+                tenant_id=int(tenant_id),
+                provider=provider_name,
+                api_key_enc=enc,
+                api_key_tail=tail,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[TenantProviderKey.tenant_id, TenantProviderKey.provider],
+                set_={
+                    "api_key_enc": enc,
+                    "api_key_tail": tail,
+                    "updated_at": func.now(),
+                },
+            )
+            session.execute(stmt)
+            cfg.api_key_tail = tail
+        session.flush()
+
+    return {
+        "tenant_id": int(tenant_id),
+        "provider": provider_name,
+        "model": model_name,
+        "base_url": base_url_clean,
+        "has_api_key": bool(tail),
+        "api_key_tail": tail,
+    }
+
+
+def upsert_tenant_key(*, tenant_id: int, provider: str, api_key_plain: str) -> Dict[str, Any]:
+    """Upsert an encrypted key for providers that use the key-only table (e.g., tavily)."""
+
+    ensure_enterprise_schema()
+    provider_name = (provider or "").strip().lower()
+    if provider_name not in KEY_PROVIDER_PRIORITY:
+        raise ValueError("unsupported provider")
+    api_key = (api_key_plain or "").strip()
+    if not api_key:
+        raise ValueError("api_key is required")
+    values = set_tenant_provider_key(tenant_id=tenant_id, provider=provider_name, api_key=api_key)
+    return {
+        "tenant_id": int(tenant_id),
+        "provider": provider_name,
+        "has_key": True,
+        "api_key_tail": values.get("api_key_tail"),
+    }
+
+
+def delete_tenant_key(*, tenant_id: int, provider: str) -> bool:
+    """Delete a stored API key for a tenant/provider."""
+
+    ensure_enterprise_schema()
+    provider_name = (provider or "").strip().lower()
+    if provider_name not in KEY_PROVIDER_PRIORITY:
+        raise ValueError("unsupported provider")
+    with get_session() as session:
+        result = session.execute(
+            delete(TenantProviderKey).where(
+                TenantProviderKey.tenant_id == int(tenant_id),
+                TenantProviderKey.provider == provider_name,
+            )
+        )
+        cfg = session.execute(
+            select(TenantProviderConfig).where(TenantProviderConfig.tenant_id == int(tenant_id))
+        ).scalar_one_or_none()
+        if cfg and cfg.provider == provider_name:
+            cfg.api_key_tail = None
+        return int(result.rowcount or 0) > 0
+
+
+def list_tenant_keys(tenant_id: int) -> List[Dict[str, Any]]:
+    """List provider keys for a tenant (db + env fallback)."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        rows = session.execute(
+            select(TenantProviderKey).where(TenantProviderKey.tenant_id == int(tenant_id))
+        ).scalars().all()
+    key_by_provider = {r.provider: r for r in rows}
+
+    items: List[Dict[str, Any]] = []
+    for provider in KEY_PROVIDER_PRIORITY:
+        env_key = _env_api_key(provider)
+        key_row = key_by_provider.get(provider)
+        api_key_tail = None
+        source = "none"
+        if key_row and key_row.api_key_enc:
+            api_key_tail = key_row.api_key_tail
+            source = "db"
+        elif env_key:
+            api_key_tail = mask_key_tail(env_key)
+            source = "env"
+
+        has_key = bool((key_row and key_row.api_key_enc) or env_key)
+        items.append(
+            {
+                "provider": provider,
+                "has_key": has_key,
+                "api_key_tail": api_key_tail,
+                "source": source,
+            }
+        )
+    return items
+
+
+def get_tenant_tavily_key(tenant_id: int) -> str:
+    """Return the Tavily key for a tenant (db first, env fallback)."""
+
+    ensure_enterprise_schema()
+    with get_session() as session:
+        row = session.execute(
+            select(TenantProviderKey).where(
+                TenantProviderKey.tenant_id == int(tenant_id),
+                TenantProviderKey.provider == "tavily",
+            )
+        ).scalar_one_or_none()
+    if row and row.api_key_enc:
+        return decrypt_secret(row.api_key_enc)
+    return os.getenv("TAVILY_API_KEY", "").strip()
+
+
+# --------------------------------------------------------------------------- #
 # Limits and usage
 # --------------------------------------------------------------------------- #
 
@@ -772,6 +972,175 @@ def increment_tenant_usage_daily(
             },
         )
         session.execute(stmt)
+
+
+# --------------------------------------------------------------------------- #
+# Tenant policy settings
+# --------------------------------------------------------------------------- #
+
+def _ensure_policy_settings(session, tenant_id: int) -> TenantPolicySettings:
+    settings = session.execute(
+        select(TenantPolicySettings).where(TenantPolicySettings.tenant_id == int(tenant_id))
+    ).scalar_one_or_none()
+    if settings:
+        return settings
+    settings = TenantPolicySettings(
+        tenant_id=int(tenant_id),
+        pii_action="redact",
+        financial_action="redact",
+        secrets_action="block",
+        health_action="redact",
+        ip_action="redact",
+        block_threshold="critical",
+        store_original_prompt=True,
+        show_sanitized_prompt_admin=True,
+    )
+    session.add(settings)
+    session.flush()
+    return settings
+
+
+def get_tenant_policy_settings(tenant_id: int) -> Dict[str, Any]:
+    ensure_enterprise_schema()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        settings = _ensure_policy_settings(session, tenant_id)
+        session.flush()
+        return _model_to_dict(settings)
+
+
+def _validate_policy_action(value: Optional[str]) -> str:
+    if value is None:
+        raise ValueError("policy action is required")
+    action = str(value).strip().lower()
+    if action not in ("allow", "redact", "block"):
+        raise ValueError("policy action must be allow, redact, or block")
+    return action
+
+
+def upsert_tenant_policy_settings(
+    tenant_id: int,
+    *,
+    pii_action: Optional[str] = None,
+    financial_action: Optional[str] = None,
+    secrets_action: Optional[str] = None,
+    health_action: Optional[str] = None,
+    ip_action: Optional[str] = None,
+    block_threshold: Optional[str] = None,
+    store_original_prompt: Optional[bool] = None,
+    show_sanitized_prompt_admin: Optional[bool] = None,
+) -> Dict[str, Any]:
+    ensure_enterprise_schema()
+    with get_session() as session:
+        _ensure_default_tenant(session)
+        settings = _ensure_policy_settings(session, tenant_id)
+
+        if pii_action is not None:
+            settings.pii_action = _validate_policy_action(pii_action)
+        if financial_action is not None:
+            settings.financial_action = _validate_policy_action(financial_action)
+        if secrets_action is not None:
+            settings.secrets_action = _validate_policy_action(secrets_action)
+        if health_action is not None:
+            settings.health_action = _validate_policy_action(health_action)
+        if ip_action is not None:
+            settings.ip_action = _validate_policy_action(ip_action)
+        if block_threshold is not None:
+            threshold = str(block_threshold or "").strip().lower()
+            if threshold not in ("high", "critical"):
+                raise ValueError("block_threshold must be high or critical")
+            settings.block_threshold = threshold
+        if store_original_prompt is not None:
+            settings.store_original_prompt = bool(store_original_prompt)
+        if show_sanitized_prompt_admin is not None:
+            settings.show_sanitized_prompt_admin = bool(show_sanitized_prompt_admin)
+
+        session.flush()
+        return _model_to_dict(settings)
+
+
+# --------------------------------------------------------------------------- #
+# Onboarding bootstrap
+# --------------------------------------------------------------------------- #
+
+def bootstrap_first_run(
+    *,
+    tenant_name: str,
+    admin_external_user: str,
+    provider: str = "gemini",
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One-time bootstrap to create tenant, admin membership, and provider config."""
+
+    ensure_enterprise_schema()
+    if has_any_admin_membership():
+        raise ValueError("Onboarding already completed")
+
+    safe_tenant_name = (tenant_name or "Default Tenant").strip() or "Default Tenant"
+    admin_user = (admin_external_user or "").strip()
+    if not admin_user:
+        raise ValueError("admin_external_user is required")
+
+    provider_name = normalize_provider_name(provider)
+    model_name = validate_model_for_provider(provider_name, model)
+    base_url_clean = normalize_optional_base_url(base_url) or default_base_url_for_provider(provider_name)
+
+    with get_session() as session:
+        tenant = _ensure_default_tenant(session)
+        tenant.name = safe_tenant_name
+        session.flush()
+
+        user = session.execute(
+            select(User).where(func.lower(User.external_id) == func.lower(admin_user))
+        ).scalar_one_or_none()
+        if not user:
+            user = User(
+                external_id=admin_user,
+                username=admin_user,
+                display_name=admin_user,
+                email=admin_user if "@" in admin_user else None,
+                is_active=True,
+            )
+            session.add(user)
+            session.flush()
+
+        membership = session.execute(
+            select(Membership).where(
+                Membership.tenant_id == int(tenant.id), Membership.user_id == int(user.id)
+            )
+        ).scalar_one_or_none()
+        if not membership:
+            membership = Membership(
+                tenant_id=int(tenant.id),
+                user_id=int(user.id),
+                role=PLATFORM_ADMIN_ROLE,
+            )
+            session.add(membership)
+        session.flush()
+        tenant_id = int(tenant.id)
+        user_id = int(user.id)
+
+    upsert_tenant_provider_config(
+        tenant_id=tenant_id,
+        provider=provider_name,
+        model=model_name,
+        api_key=api_key,
+        base_url=base_url_clean,
+    )
+    get_tenant_policy_settings(tenant_id)
+
+    return {
+        "ok": True,
+        "tenant_id": tenant_id,
+        "tenant_name": safe_tenant_name,
+        "admin_user_id": user_id,
+        "provider": provider_name,
+        "model": model_name,
+        "base_url": base_url_clean,
+        "has_api_key": bool(api_key),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -907,4 +1276,3 @@ def insert_request(row: Dict[str, Any], tenant_id: int) -> None:
         stmt = _dialect_insert(Request).values(**values)
         stmt = stmt.on_conflict_do_update(index_elements=[Request.id], set_=values)
         session.execute(stmt)
-
