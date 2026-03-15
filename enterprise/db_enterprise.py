@@ -234,7 +234,7 @@ class User(Base):
     email = Column(String, unique=True)
     password_hash = Column(String)
     password_salt = Column(String)
-    is_active = Column(Boolean, nullable=False, server_default=text("1"))
+    is_active = Column(Boolean, default=True, nullable=False, server_default=text("true"))
     locked_until = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
