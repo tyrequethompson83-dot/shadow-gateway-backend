@@ -111,61 +111,179 @@ def _verify_password(password: str, password_hash: str, password_salt: str) -> b
     return verify_legacy_password(password or "", hashed, password_salt or "")
 
 
+from sqlalchemy import text, inspect
+from sqlalchemy.engine import Connection
+
 def ensure_product_auth_schema() -> None:
+    """Ensure all auth-related tables and columns exist; safe for SQLite & Postgres."""
     _ensure_enterprise_schema()
     with _get_conn() as conn:
-        user_cols = _table_columns(conn, "users")
+        inspector = inspect(conn)
+
+        # --- Users table ---
+        user_cols = [c["name"] for c in inspector.get_columns("users")] if "users" in inspector.get_table_names() else []
+
         if "email" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            conn.execute(text("ALTER TABLE users ADD COLUMN email TEXT"))
         if "locked_until" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN locked_until TEXT")
-        conn.execute(
-            """
-            UPDATE users
-            SET email = LOWER(username)
-            WHERE (email IS NULL OR email = '')
-              AND username IS NOT NULL
-              AND username LIKE '%@%'
-            """
-        )
-        conn.execute(
-            """
-            UPDATE users
-            SET email = LOWER(external_id)
-            WHERE (email IS NULL OR email = '')
-              AND external_id IS NOT NULL
-              AND external_id LIKE '%@%'
-            """
-        )
-        conn.execute(
+            conn.execute(text("ALTER TABLE users ADD COLUMN locked_until TEXT"))
+
+        # Normalize emails safely
+        if "users" in inspector.get_table_names():
+            conn.execute(
+                text("""
+                    UPDATE users
+                    SET email = LOWER(username)
+                    WHERE (email IS NULL OR email = '')
+                      AND username IS NOT NULL
+                      AND username LIKE :pattern
+                """),
+                {"pattern": "%@%"}
+            )
+            conn.execute(
+                text("""
+                    UPDATE users
+                    SET email = LOWER(external_id)
+                    WHERE (email IS NULL OR email = '')
+                      AND external_id IS NOT NULL
+                      AND external_id LIKE :pattern
+                """),
+                {"pattern": "%@%"}
+            )
+
+        # Unique index on email
+        conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL"
-        )
+        ))
 
-        tenant_cols = _table_columns(conn, "tenants")
+        # --- Tenants table ---
+        tenant_cols = [c["name"] for c in inspector.get_columns("tenants")] if "tenants" in inspector.get_table_names() else []
         if "is_personal" not in tenant_cols:
-            conn.execute("ALTER TABLE tenants ADD COLUMN is_personal INTEGER NOT NULL DEFAULT 0")
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN is_personal INTEGER NOT NULL DEFAULT 0"))
 
-        duplicate_names = conn.execute(
-            """
+        # Deduplicate tenant names
+        duplicates = conn.execute(text("""
             SELECT name
             FROM tenants
             GROUP BY name
             HAVING COUNT(1) > 1
-            """
-        ).fetchall()
-        for dup in duplicate_names:
+        """)).fetchall()
+
+        for dup in duplicates:
             name = str(dup["name"] or "")
-            rows = conn.execute(
-                "SELECT id FROM tenants WHERE name = ? ORDER BY id ASC",
-                (name,),
-            ).fetchall()
+            rows = conn.execute(text(
+                "SELECT id FROM tenants WHERE name = :name ORDER BY id ASC"
+            ), {"name": name}).fetchall()
             for row in rows[1:]:
                 tenant_id = int(row["id"])
-                conn.execute(
-                    "UPDATE tenants SET name = ? WHERE id = ?",
-                    (f"{name} ({tenant_id})", tenant_id),
+                conn.execute(text(
+                    "UPDATE tenants SET name = :new_name WHERE id = :id"
+                ), {"new_name": f"{name} ({tenant_id})", "id": tenant_id})
+
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_name_unique ON tenants(name)"))
+
+        # --- Memberships table ---
+        memberships_exist = "memberships" in inspector.get_table_names()
+        if memberships_exist:
+            sql_row = conn.execute(text(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memberships'"
+            )).fetchone()
+            memberships_sql = (sql_row[0] if sql_row and sql_row[0] else "").lower()
+        else:
+            memberships_sql = ""
+
+        if any(k not in memberships_sql for k in ("tenant_admin", "employee", "platform_admin")):
+            # Create v2 table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS memberships_v2 (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id INTEGER NOT NULL,
+                  user_id INTEGER NOT NULL,
+                  role TEXT NOT NULL CHECK(role IN ('platform_admin','admin','auditor','user','tenant_admin','employee')),
+                  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                  UNIQUE(tenant_id, user_id),
+                  FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+                  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 )
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_name_unique ON tenants(name)")
+            """))
+            conn.execute(text("""
+                INSERT OR REPLACE INTO memberships_v2 (id, tenant_id, user_id, role, created_at)
+                SELECT
+                  id,
+                  tenant_id,
+                  user_id,
+                  CASE
+                    WHEN role = 'admin' THEN 'platform_admin'
+                    WHEN role IN ('platform_admin', 'auditor', 'user', 'tenant_admin', 'employee') THEN role
+                    ELSE 'employee'
+                  END,
+                  created_at
+                FROM memberships
+            """))
+            conn.execute(text("DROP TABLE memberships"))
+            conn.execute(text("ALTER TABLE memberships_v2 RENAME TO memberships"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_memberships_tenant_role ON memberships(tenant_id, role)"))
+
+        # --- Invite tokens ---
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS invite_tokens (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              tenant_id INTEGER NOT NULL,
+              token TEXT NOT NULL UNIQUE,
+              email TEXT,
+              role TEXT NOT NULL CHECK(role IN ('tenant_admin','employee')),
+              expires_at TEXT NOT NULL,
+              max_uses INTEGER,
+              uses_count INTEGER NOT NULL DEFAULT 0,
+              used_at TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+            )
+        """))
+
+        invite_cols = [c["name"] for c in inspector.get_columns("invite_tokens")] if "invite_tokens" in inspector.get_table_names() else []
+        if "max_uses" not in invite_cols:
+            conn.execute(text("ALTER TABLE invite_tokens ADD COLUMN max_uses INTEGER"))
+        if "uses_count" not in invite_cols:
+            conn.execute(text("ALTER TABLE invite_tokens ADD COLUMN uses_count INTEGER NOT NULL DEFAULT 0"))
+
+        conn.execute(text("""
+            UPDATE invite_tokens
+            SET uses_count = CASE
+              WHEN used_at IS NOT NULL AND COALESCE(max_uses, 0) = 0 THEN 1
+              ELSE COALESCE(uses_count, 0)
+            END
+        """))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invite_tokens_tenant ON invite_tokens(tenant_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invite_tokens_token ON invite_tokens(token)"))
+
+        # --- Auth login events ---
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS auth_login_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER,
+              email TEXT NOT NULL,
+              success INTEGER NOT NULL CHECK(success IN (0,1)),
+              ip_address TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_login_email_created ON auth_login_events(email, created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_login_user_created ON auth_login_events(user_id, created_at)"))
+
+        # --- Revoked tokens ---
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+              jti TEXT PRIMARY KEY,
+              user_id INTEGER,
+              tenant_id INTEGER,
+              revoked_at TEXT NOT NULL,
+              expires_at INTEGER NOT NULL
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires ON revoked_tokens(expires_at)"))
 
         memberships_sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='memberships'"
