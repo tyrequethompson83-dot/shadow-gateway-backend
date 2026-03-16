@@ -476,7 +476,7 @@ def ensure_enterprise_schema() -> None:
 # --------------------------------------------------------------------------- #
 
 def _ensure_default_tenant(session) -> Tenant:
-    tenant = session.execute(select(Tenant).order_by(Tenant.id)).scalar_one_or_none()
+    tenant = session.execute(select(Tenant).order_by(Tenant.id).limit(1)).scalar_one_or_none()
     if tenant:
         return tenant
     tenant = Tenant(name="Default Tenant", is_personal=False)
@@ -729,8 +729,12 @@ def _env_api_key(provider: str) -> str:
 
 
 def _ensure_provider_config(session, tenant_id: int) -> TenantProviderConfig:
+    # Historical deployments may have allowed duplicate rows (missing/incorrect PK/unique constraint).
+    # Limit(1) avoids 500s from scalar_one_or_none() until repair migrations de-dupe/enforce uniqueness.
     cfg = session.execute(
-        select(TenantProviderConfig).where(TenantProviderConfig.tenant_id == int(tenant_id))
+        select(TenantProviderConfig)
+        .where(TenantProviderConfig.tenant_id == int(tenant_id))
+        .limit(1)
     ).scalar_one_or_none()
     if cfg:
         return cfg
@@ -787,6 +791,7 @@ def get_tenant_provider_config(tenant_id: int) -> Dict[str, Any]:
                 TenantProviderKey.tenant_id == int(tenant_id),
                 TenantProviderKey.provider == cfg.provider,
             )
+            .limit(1)
         ).scalar_one_or_none()
 
     env_key = _env_api_key(cfg.provider)
@@ -816,6 +821,7 @@ def get_tenant_provider_runtime_config(tenant_id: int) -> Dict[str, Any]:
                 TenantProviderKey.tenant_id == int(tenant_id),
                 TenantProviderKey.provider == cfg.provider,
             )
+            .limit(1)
         ).scalar_one_or_none()
 
     env_key = _env_api_key(cfg.provider)
@@ -985,6 +991,7 @@ def get_tenant_tavily_key(tenant_id: int) -> str:
                 TenantProviderKey.tenant_id == int(tenant_id),
                 TenantProviderKey.provider == "tavily",
             )
+            .limit(1)
         ).scalar_one_or_none()
     if row and row.api_key_enc:
         return decrypt_secret(row.api_key_enc)

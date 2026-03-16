@@ -42,11 +42,17 @@ def run_migrations() -> None:
     files = sorted(f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql"))
 
     with engine.connect() as conn:
+        locked = False
         if engine.dialect.name == "postgresql":
+            # Execute the advisory lock outside an explicit migration transaction.
+            # SQLAlchemy 2.x starts an implicit transaction on execute(), so we
+            # commit immediately to avoid nested begin()/autobegin conflicts.
             conn.execute(text("SELECT pg_advisory_lock(:key)"), {"key": POSTGRES_MIGRATION_LOCK_KEY})
+            conn.commit()
+            locked = True
         try:
-            with conn.begin():
-                for file in files:
+            for file in files:
+                with conn.begin():
                     applied = conn.execute(
                         text(f"SELECT 1 FROM {MIGRATION_TABLE} WHERE filename = :file"),
                         {"file": file},
@@ -73,13 +79,15 @@ def run_migrations() -> None:
                         text(f"INSERT INTO {MIGRATION_TABLE} (filename) VALUES (:file)"),
                         {"file": file},
                     )
-                    print(f"Applied migration: {file}")
+
+                print(f"Applied migration: {file}")
         finally:
-            if engine.dialect.name == "postgresql":
+            if locked:
                 try:
                     conn.execute(
                         text("SELECT pg_advisory_unlock(:key)"),
                         {"key": POSTGRES_MIGRATION_LOCK_KEY},
                     )
+                    conn.commit()
                 except Exception:
                     pass

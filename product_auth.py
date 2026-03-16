@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import threading
 from typing import Any, Dict, List, Optional
 
-from passlib.context import CryptContext
+import bcrypt
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
 
@@ -37,7 +37,7 @@ COMMON_WEAK_PASSWORDS = {
 }
 
 # Password hashing
-_PWD_CONTEXT = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_BCRYPT_ROUNDS = 12
 
 class LoginError(ValueError):
     def __init__(self, message: str, *, code: str):
@@ -107,7 +107,8 @@ def _validate_password_policy(password: str) -> str:
 
 def _hash_password(password: str) -> str:
     raw = _validate_password_policy(password)
-    return _PWD_CONTEXT.hash(raw)
+    salt = bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)
+    return bcrypt.hashpw(raw.encode("utf-8"), salt).decode("utf-8")
 
 def _verify_password(password: str, password_hash: str, password_salt: str) -> bool:
     hashed = (password_hash or "").strip()
@@ -115,7 +116,12 @@ def _verify_password(password: str, password_hash: str, password_salt: str) -> b
         return False
     if hashed.startswith("$2"):
         try:
-            return bool(_PWD_CONTEXT.verify(password or "", hashed))
+            return bool(
+                bcrypt.checkpw(
+                    (password or "").encode("utf-8"),
+                    hashed.encode("utf-8"),
+                )
+            )
         except Exception:
             return False
     return verify_legacy_password(password or "", hashed, password_salt or "")
