@@ -1,5 +1,6 @@
 import secrets
 from datetime import datetime, timedelta, timezone
+import threading
 from typing import Any, Dict, List, Optional
 
 from passlib.context import CryptContext
@@ -43,6 +44,9 @@ class LoginError(ValueError):
         super().__init__(message)
         self.code = code
 
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY = False
+
 
 # --- Utility Functions ---
 
@@ -54,6 +58,9 @@ def _get_conn():
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _utcnow_dt() -> datetime:
+    return datetime.now(timezone.utc)
 
 def _normalize_email(value: str) -> str:
     email = (value or "").strip().lower()
@@ -69,6 +76,20 @@ def _table_columns(conn: Connection, table_name: str) -> List[str]:
     if table_name not in inspector.get_table_names():
         return []
     return [col["name"] for col in inspector.get_columns(table_name)]
+
+def _is_postgres(conn: Connection) -> bool:
+    try:
+        return str(conn.dialect.name) == "postgresql"
+    except Exception:
+        return False
+
+def _add_column_if_missing(conn: Connection, table: str, column: str, ddl: str) -> None:
+    if _is_postgres(conn):
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}"))
+        return
+    cols = _table_columns(conn, table)
+    if column not in cols:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
 
 def _normalize_role_name(role: str) -> str:
     role_name = (role or "").strip()
@@ -113,153 +134,155 @@ def _parse_iso_utc(value: Optional[str]) -> Optional[datetime]:
 
 def ensure_product_auth_schema() -> None:
     """Ensure all auth-related tables and columns exist; PostgreSQL-ready."""
-    _ensure_enterprise_schema()
-    with _get_conn() as conn:
-        inspector = inspect(conn)
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
 
-        # --- Users table ---
-        user_cols = [c["name"] for c in inspector.get_columns("users")] if "users" in inspector.get_table_names() else []
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
 
-        if "email" not in user_cols:
-            conn.execute(text("ALTER TABLE users ADD COLUMN email TEXT"))
-        if "locked_until" not in user_cols:
-            conn.execute(text("ALTER TABLE users ADD COLUMN locked_until TIMESTAMPTZ"))
+        _ensure_enterprise_schema()
+        with _get_conn() as conn:
+            inspector = inspect(conn)
 
-        # Normalize emails safely
-        if "users" in inspector.get_table_names():
+            # --- Users table ---
+            _add_column_if_missing(conn, "users", "email", "TEXT")
+            _add_column_if_missing(conn, "users", "locked_until", "TIMESTAMPTZ")
+
+            if "users" in inspector.get_table_names():
+                conn.execute(text("""
+                    UPDATE users
+                    SET email = LOWER(username)
+                    WHERE (email IS NULL OR email = '')
+                      AND username IS NOT NULL
+                      AND username LIKE :pattern
+                """), {"pattern": "%@%"})
+
+                conn.execute(text("""
+                    UPDATE users
+                    SET email = LOWER(external_id)
+                    WHERE (email IS NULL OR email = '')
+                      AND external_id IS NOT NULL
+                      AND external_id LIKE :pattern
+                """), {"pattern": "%@%"})
+
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL"
+            ))
+
+            # --- Tenants table ---
+            _add_column_if_missing(conn, "tenants", "is_personal", "BOOLEAN NOT NULL DEFAULT FALSE")
+
+            duplicates = conn.execute(text("""
+                SELECT name
+                FROM tenants
+                GROUP BY name
+                HAVING COUNT(1) > 1
+            """)).fetchall()
+
+            for dup in duplicates:
+                name = str(dup["name"] or "")
+                rows = conn.execute(
+                    text("SELECT id FROM tenants WHERE name = :name ORDER BY id ASC"),
+                    {"name": name},
+                ).fetchall()
+                for row in rows[1:]:
+                    tenant_id = int(row["id"])
+                    conn.execute(
+                        text("UPDATE tenants SET name = :new_name WHERE id = :id"),
+                        {"new_name": f"{name} ({tenant_id})", "id": tenant_id},
+                    )
+
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_name_unique ON tenants(name)"))
+
+            # --- Memberships table ---
+            memberships_exist = "memberships" in inspector.get_table_names()
+            if memberships_exist:
+                conn.execute(text("""
+                    UPDATE memberships
+                    SET role = CASE
+                        WHEN role = 'admin' THEN 'platform_admin'
+                        WHEN role IN ('platform_admin', 'auditor', 'user', 'tenant_admin', 'employee') THEN role
+                        ELSE 'employee'
+                    END
+                """))
+            else:
+                conn.execute(text("""
+                    CREATE TABLE memberships (
+                      id SERIAL PRIMARY KEY,
+                      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                      role TEXT NOT NULL CHECK(role IN ('platform_admin','admin','auditor','user','tenant_admin','employee')),
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      UNIQUE(tenant_id, user_id)
+                    )
+                """))
+
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_memberships_tenant_role ON memberships(tenant_id, role)"))
+
+            # --- Invite tokens ---
+            if "invite_tokens" not in inspector.get_table_names():
+                conn.execute(text("""
+                    CREATE TABLE invite_tokens (
+                      id SERIAL PRIMARY KEY,
+                      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                      token TEXT NOT NULL UNIQUE,
+                      email TEXT,
+                      role TEXT NOT NULL CHECK(role IN ('tenant_admin','employee')),
+                      expires_at TIMESTAMPTZ NOT NULL,
+                      max_uses INTEGER,
+                      uses_count INTEGER NOT NULL DEFAULT 0,
+                      used_at TIMESTAMPTZ,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """))
+
+            _add_column_if_missing(conn, "invite_tokens", "max_uses", "INTEGER")
+            _add_column_if_missing(conn, "invite_tokens", "uses_count", "INTEGER NOT NULL DEFAULT 0")
+
             conn.execute(text("""
-                UPDATE users
-                SET email = LOWER(username)
-                WHERE (email IS NULL OR email = '')
-                  AND username IS NOT NULL
-                  AND username LIKE :pattern
-            """), {"pattern": "%@%"})
-
-            conn.execute(text("""
-                UPDATE users
-                SET email = LOWER(external_id)
-                WHERE (email IS NULL OR email = '')
-                  AND external_id IS NOT NULL
-                  AND external_id LIKE :pattern
-            """), {"pattern": "%@%"})
-
-        # Unique index on email
-        conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL"
-        ))
-
-        # --- Tenants table ---
-        tenant_cols = [c["name"] for c in inspector.get_columns("tenants")] if "tenants" in inspector.get_table_names() else []
-        if "is_personal" not in tenant_cols:
-            conn.execute(text("ALTER TABLE tenants ADD COLUMN is_personal BOOLEAN NOT NULL DEFAULT FALSE"))
-
-        # Deduplicate tenant names
-        duplicates = conn.execute(text("""
-            SELECT name
-            FROM tenants
-            GROUP BY name
-            HAVING COUNT(1) > 1
-        """)).fetchall()
-
-        for dup in duplicates:
-            name = str(dup["name"] or "")
-            rows = conn.execute(text("SELECT id FROM tenants WHERE name = :name ORDER BY id ASC"), {"name": name}).fetchall()
-            for row in rows[1:]:
-                tenant_id = int(row["id"])
-                conn.execute(text("UPDATE tenants SET name = :new_name WHERE id = :id"), {"new_name": f"{name} ({tenant_id})", "id": tenant_id})
-
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_name_unique ON tenants(name)"))
-
-        # --- Memberships table ---
-        memberships_exist = "memberships" in inspector.get_table_names()
-
-        if memberships_exist:
-            # Update legacy roles to product roles in place
-            conn.execute(text("""
-                UPDATE memberships
-                SET role = CASE
-                    WHEN role = 'admin' THEN 'platform_admin'
-                    WHEN role IN ('platform_admin', 'auditor', 'user', 'tenant_admin', 'employee') THEN role
-                    ELSE 'employee'
+                UPDATE invite_tokens
+                SET uses_count = CASE
+                  WHEN used_at IS NOT NULL AND COALESCE(max_uses, 0) = 0 THEN 1
+                  ELSE COALESCE(uses_count, 0)
                 END
             """))
-        else:
-            conn.execute(text("""
-                CREATE TABLE memberships (
-                  id SERIAL PRIMARY KEY,
-                  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-                  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                  role TEXT NOT NULL CHECK(role IN ('platform_admin','admin','auditor','user','tenant_admin','employee')),
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                  UNIQUE(tenant_id, user_id)
-                )
-            """))
 
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_memberships_tenant_role ON memberships(tenant_id, role)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invite_tokens_tenant ON invite_tokens(tenant_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invite_tokens_token ON invite_tokens(token)"))
 
-        # --- Invite tokens ---
-        if "invite_tokens" not in inspector.get_table_names():
-            conn.execute(text("""
-                CREATE TABLE invite_tokens (
-                  id SERIAL PRIMARY KEY,
-                  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-                  token TEXT NOT NULL UNIQUE,
-                  email TEXT,
-                  role TEXT NOT NULL CHECK(role IN ('tenant_admin','employee')),
-                  expires_at TIMESTAMPTZ NOT NULL,
-                  max_uses INTEGER,
-                  uses_count INTEGER NOT NULL DEFAULT 0,
-                  used_at TIMESTAMPTZ,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """))
+            # --- Auth login events ---
+            if "auth_login_events" not in inspector.get_table_names():
+                conn.execute(text("""
+                    CREATE TABLE auth_login_events (
+                      id SERIAL PRIMARY KEY,
+                      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                      email TEXT NOT NULL,
+                      success BOOLEAN NOT NULL,
+                      ip_address TEXT,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """))
 
-        invite_cols = [c["name"] for c in inspector.get_columns("invite_tokens")] if "invite_tokens" in inspector.get_table_names() else []
-        if "max_uses" not in invite_cols:
-            conn.execute(text("ALTER TABLE invite_tokens ADD COLUMN max_uses INTEGER"))
-        if "uses_count" not in invite_cols:
-            conn.execute(text("ALTER TABLE invite_tokens ADD COLUMN uses_count INTEGER NOT NULL DEFAULT 0"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_login_email_created ON auth_login_events(email, created_at)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_login_user_created ON auth_login_events(user_id, created_at)"))
 
-        conn.execute(text("""
-            UPDATE invite_tokens
-            SET uses_count = CASE
-              WHEN used_at IS NOT NULL AND COALESCE(max_uses, 0) = 0 THEN 1
-              ELSE COALESCE(uses_count, 0)
-            END
-        """))
+            # --- Revoked tokens ---
+            if "revoked_tokens" not in inspector.get_table_names():
+                conn.execute(text("""
+                    CREATE TABLE revoked_tokens (
+                      jti TEXT PRIMARY KEY,
+                      user_id INTEGER,
+                      tenant_id INTEGER,
+                      revoked_at TIMESTAMPTZ NOT NULL,
+                      expires_at TIMESTAMPTZ NOT NULL
+                    )
+                """))
 
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invite_tokens_tenant ON invite_tokens(tenant_id)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_invite_tokens_token ON invite_tokens(token)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires ON revoked_tokens(expires_at)"))
 
-        # --- Auth login events ---
-        if "auth_login_events" not in inspector.get_table_names():
-            conn.execute(text("""
-                CREATE TABLE auth_login_events (
-                  id SERIAL PRIMARY KEY,
-                  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                  email TEXT NOT NULL,
-                  success BOOLEAN NOT NULL,
-                  ip_address TEXT,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """))
-
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_login_email_created ON auth_login_events(email, created_at)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_login_user_created ON auth_login_events(user_id, created_at)"))
-
-        # --- Revoked tokens ---
-        if "revoked_tokens" not in inspector.get_table_names():
-            conn.execute(text("""
-                CREATE TABLE revoked_tokens (
-                  jti TEXT PRIMARY KEY,
-                  user_id INTEGER,
-                  tenant_id INTEGER,
-                  revoked_at TIMESTAMPTZ NOT NULL,
-                  expires_at TIMESTAMPTZ NOT NULL
-                )
-            """))
-
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires ON revoked_tokens(expires_at)"))
+        _SCHEMA_READY = True
         
 # --- Remaining business logic ---
 # All other functions like create_user_account, authenticate_login, signup_with_invite, etc.
@@ -285,57 +308,60 @@ def _record_login_event(*, user_id: Optional[int], email: str, success: bool, ip
     normalized_email = (email or "").strip().lower()
     with _get_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO auth_login_events (user_id, email, success, ip_address, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                int(user_id) if user_id is not None else None,
-                normalized_email,
-                int(bool(success)),
-                (ip_address or "").strip() or None,
-                _utcnow_iso(),
-            ),
+            text("""
+                INSERT INTO auth_login_events (user_id, email, success, ip_address)
+                VALUES (:user_id, :email, :success, :ip_address)
+            """),
+            {
+                "user_id": int(user_id) if user_id is not None else None,
+                "email": normalized_email,
+                "success": bool(success),
+                "ip_address": (ip_address or "").strip() or None,
+            },
         )
 
 
 def _failed_login_count_in_window(*, user_id: int, email: str, minutes: int) -> int:
     ensure_product_auth_schema()
-    threshold = (datetime.now(timezone.utc) - timedelta(minutes=max(1, int(minutes)))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    threshold = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(minutes)))
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT COUNT(1) AS c
-            FROM auth_login_events
-            WHERE success = 0
-              AND created_at >= ?
-              AND (user_id = ? OR email = ?)
-            """,
-            (threshold, int(user_id), (email or "").strip().lower()),
-        ).fetchone()
-    return int(row["c"] or 0) if row else 0
+            text("""
+                SELECT COUNT(1) AS c
+                FROM auth_login_events
+                WHERE success = FALSE
+                  AND created_at >= :threshold
+                  AND (user_id = :user_id OR email = :email)
+            """),
+            {"threshold": threshold, "user_id": int(user_id), "email": (email or "").strip().lower()},
+        ).mappings().first()
+    return int((row or {}).get("c") or 0)
 
 
 def _set_user_lockout(user_id: int, until_utc: datetime) -> None:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         conn.execute(
-            "UPDATE users SET locked_until = ? WHERE id = ?",
-            (until_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), int(user_id)),
+            text("UPDATE users SET locked_until = :until WHERE id = :id"),
+            {"until": until_utc, "id": int(user_id)},
         )
 
 
 def _clear_user_lockout(user_id: int) -> None:
     ensure_product_auth_schema()
     with _get_conn() as conn:
-        conn.execute("UPDATE users SET locked_until = NULL WHERE id = ?", (int(user_id),))
+        conn.execute(text("UPDATE users SET locked_until = NULL WHERE id = :id"), {"id": int(user_id)})
 
 
 def purge_expired_revoked_tokens(now_ts: Optional[int] = None) -> None:
     ensure_product_auth_schema()
-    current = int(now_ts) if now_ts is not None else int(datetime.now(timezone.utc).timestamp())
+    current = (
+        datetime.fromtimestamp(int(now_ts), tz=timezone.utc)
+        if now_ts is not None
+        else datetime.now(timezone.utc)
+    )
     with _get_conn() as conn:
-        conn.execute("DELETE FROM revoked_tokens WHERE expires_at <= ?", (current,))
+        conn.execute(text("DELETE FROM revoked_tokens WHERE expires_at <= :now"), {"now": current})
 
 
 def revoke_token_jti(*, jti: str, user_id: Optional[int], tenant_id: Optional[int], expires_at: int) -> None:
@@ -346,22 +372,22 @@ def revoke_token_jti(*, jti: str, user_id: Optional[int], tenant_id: Optional[in
     purge_expired_revoked_tokens()
     with _get_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO revoked_tokens (jti, user_id, tenant_id, revoked_at, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(jti) DO UPDATE SET
-              user_id = excluded.user_id,
-              tenant_id = excluded.tenant_id,
-              revoked_at = excluded.revoked_at,
-              expires_at = excluded.expires_at
-            """,
-            (
-                token_jti,
-                int(user_id) if user_id is not None else None,
-                int(tenant_id) if tenant_id is not None else None,
-                _utcnow_iso(),
-                int(expires_at),
-            ),
+            text("""
+                INSERT INTO revoked_tokens (jti, user_id, tenant_id, revoked_at, expires_at)
+                VALUES (:jti, :user_id, :tenant_id, :revoked_at, :expires_at)
+                ON CONFLICT(jti) DO UPDATE SET
+                  user_id = excluded.user_id,
+                  tenant_id = excluded.tenant_id,
+                  revoked_at = excluded.revoked_at,
+                  expires_at = excluded.expires_at
+            """),
+            {
+                "jti": token_jti,
+                "user_id": int(user_id) if user_id is not None else None,
+                "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                "revoked_at": _utcnow_dt(),
+                "expires_at": datetime.fromtimestamp(int(expires_at), tz=timezone.utc),
+            },
         )
 
 
@@ -372,7 +398,10 @@ def is_token_revoked(jti: Optional[str]) -> bool:
     ensure_product_auth_schema()
     purge_expired_revoked_tokens()
     with _get_conn() as conn:
-        row = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ? LIMIT 1", (token_jti,)).fetchone()
+        row = conn.execute(
+            text("SELECT 1 FROM revoked_tokens WHERE jti = :jti LIMIT 1"),
+            {"jti": token_jti},
+        ).first()
     return bool(row)
 
 
@@ -392,16 +421,16 @@ def get_user_by_identifier(identifier: str) -> Optional[Dict[str, Any]]:
         return None
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT id, email, username, external_id, display_name, password_hash, password_salt, is_active, locked_until, created_at
-            FROM users
-            WHERE LOWER(COALESCE(email, '')) = ?
-               OR LOWER(COALESCE(username, '')) = ?
-               OR LOWER(COALESCE(external_id, '')) = ?
-            LIMIT 1
-            """,
-            (normalized, normalized, normalized),
-        ).fetchone()
+            text("""
+                SELECT id, email, username, external_id, display_name, password_hash, password_salt, is_active, locked_until, created_at
+                FROM users
+                WHERE LOWER(COALESCE(email, '')) = :val
+                   OR LOWER(COALESCE(username, '')) = :val
+                   OR LOWER(COALESCE(external_id, '')) = :val
+                LIMIT 1
+            """),
+            {"val": normalized},
+        ).mappings().first()
         return dict(row) if row else None
 
 
@@ -409,13 +438,13 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT id, email, username, external_id, display_name, password_hash, password_salt, is_active, locked_until, created_at
-            FROM users
-            WHERE id = ?
-            """,
-            (int(user_id),),
-        ).fetchone()
+            text("""
+                SELECT id, email, username, external_id, display_name, password_hash, password_salt, is_active, locked_until, created_at
+                FROM users
+                WHERE id = :id
+            """),
+            {"id": int(user_id)},
+        ).mappings().first()
         return dict(row) if row else None
 
 
@@ -429,14 +458,37 @@ def create_user_account(email: str, password: str) -> Dict[str, Any]:
     pw_hash = _hash_password(password)
     display_name = normalized.split("@", 1)[0]
     with _get_conn() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO users (email, external_id, username, display_name, password_hash, password_salt, is_active)
-            VALUES (?, ?, ?, ?, ?, '', 1)
-            """,
-            (normalized, normalized, normalized, display_name, pw_hash),
-        )
-        user_id = int(cur.lastrowid)
+        if _is_postgres(conn):
+            row = conn.execute(
+                text("""
+                    INSERT INTO users (email, external_id, username, display_name, password_hash, password_salt, is_active)
+                    VALUES (:email, :external_id, :username, :display_name, :password_hash, '', TRUE)
+                    RETURNING id
+                """),
+                {
+                    "email": normalized,
+                    "external_id": normalized,
+                    "username": normalized,
+                    "display_name": display_name,
+                    "password_hash": pw_hash,
+                },
+            ).first()
+            user_id = int(row[0]) if row else 0
+        else:
+            cur = conn.execute(
+                text("""
+                    INSERT INTO users (email, external_id, username, display_name, password_hash, password_salt, is_active)
+                    VALUES (:email, :external_id, :username, :display_name, :password_hash, '', 1)
+                """),
+                {
+                    "email": normalized,
+                    "external_id": normalized,
+                    "username": normalized,
+                    "display_name": display_name,
+                    "password_hash": pw_hash,
+                },
+            )
+            user_id = int(getattr(cur, "lastrowid", 0) or 0)
 
     row = get_user_by_id(user_id)
     if not row:
@@ -449,12 +501,12 @@ def update_user_password(user_id: int, password: str) -> None:
     pw_hash = _hash_password(password)
     with _get_conn() as conn:
         conn.execute(
-            """
-            UPDATE users
-            SET password_hash = ?, password_salt = '', is_active = 1, locked_until = NULL
-            WHERE id = ?
-            """,
-            (pw_hash, int(user_id)),
+            text("""
+                UPDATE users
+                SET password_hash = :password_hash, password_salt = '', is_active = TRUE, locked_until = NULL
+                WHERE id = :id
+            """),
+            {"password_hash": pw_hash, "id": int(user_id)},
         )
 
 
@@ -465,12 +517,12 @@ def create_membership(tenant_id: int, user_id: int, role: str) -> None:
         raise ValueError("invalid role")
     with _get_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO memberships (tenant_id, user_id, role)
-            VALUES (?, ?, ?)
-            ON CONFLICT(tenant_id, user_id) DO UPDATE SET role = excluded.role
-            """,
-            (int(tenant_id), int(user_id), role_name),
+            text("""
+                INSERT INTO memberships (tenant_id, user_id, role)
+                VALUES (:tenant_id, :user_id, :role)
+                ON CONFLICT(tenant_id, user_id) DO UPDATE SET role = excluded.role
+            """),
+            {"tenant_id": int(tenant_id), "user_id": int(user_id), "role": role_name},
         )
 
 
@@ -478,62 +530,62 @@ def has_membership(user_id: int, tenant_id: int) -> bool:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT COUNT(1) AS c
-            FROM memberships
-            WHERE tenant_id = ? AND user_id = ?
-            """,
-            (int(tenant_id), int(user_id)),
-        ).fetchone()
-    return bool(row and int(row["c"]) > 0)
+            text("""
+                SELECT COUNT(1) AS c
+                FROM memberships
+                WHERE tenant_id = :tenant_id AND user_id = :user_id
+            """),
+            {"tenant_id": int(tenant_id), "user_id": int(user_id)},
+        ).mappings().first()
+    return bool(row and int(row.get("c") or 0) > 0)
 
 
 def get_membership_role(user_id: int, tenant_id: int) -> Optional[str]:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT role
-            FROM memberships
-            WHERE tenant_id = ? AND user_id = ?
-            """,
-            (int(tenant_id), int(user_id)),
-        ).fetchone()
-    return _normalize_role_name(str(row["role"])) if row else None
+            text("""
+                SELECT role
+                FROM memberships
+                WHERE tenant_id = :tenant_id AND user_id = :user_id
+            """),
+            {"tenant_id": int(tenant_id), "user_id": int(user_id)},
+        ).mappings().first()
+    return _normalize_role_name(str(row.get("role"))) if row else None
 
 
 def is_personal_tenant(tenant_id: int) -> bool:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT COALESCE(is_personal, 0) AS is_personal
-            FROM tenants
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (int(tenant_id),),
-        ).fetchone()
-    return bool(row and int(row["is_personal"] or 0))
+            text("""
+                SELECT COALESCE(is_personal, FALSE) AS is_personal
+                FROM tenants
+                WHERE id = :id
+                LIMIT 1
+            """),
+            {"id": int(tenant_id)},
+        ).mappings().first()
+    return bool(row and bool(row.get("is_personal")))
 
 
 def list_user_memberships(user_id: int) -> List[Dict[str, Any]]:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT
-              m.tenant_id,
-              t.name AS tenant_name,
-              COALESCE(t.is_personal, 0) AS is_personal,
-              m.role
-            FROM memberships m
-            JOIN tenants t ON t.id = m.tenant_id
-            WHERE m.user_id = ?
-            ORDER BY m.tenant_id ASC
-            """,
-            (int(user_id),),
-        ).fetchall()
+            text("""
+                SELECT
+                  m.tenant_id,
+                  t.name AS tenant_name,
+                  COALESCE(t.is_personal, FALSE) AS is_personal,
+                  m.role
+                FROM memberships m
+                JOIN tenants t ON t.id = m.tenant_id
+                WHERE m.user_id = :user_id
+                ORDER BY m.tenant_id ASC
+            """),
+            {"user_id": int(user_id)},
+        ).mappings().all()
     normalized: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -546,21 +598,21 @@ def list_tenant_members(tenant_id: int) -> List[Dict[str, Any]]:
     ensure_product_auth_schema()
     with _get_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT
-              m.tenant_id,
-              m.user_id,
-              COALESCE(u.email, u.username, u.external_id) AS email,
-              u.display_name,
-              m.role,
-              m.created_at
-            FROM memberships m
-            JOIN users u ON u.id = m.user_id
-            WHERE m.tenant_id = ?
-            ORDER BY m.created_at ASC, m.user_id ASC
-            """,
-            (int(tenant_id),),
-        ).fetchall()
+            text("""
+                SELECT
+                  m.tenant_id,
+                  m.user_id,
+                  COALESCE(u.email, u.username, u.external_id) AS email,
+                  u.display_name,
+                  m.role,
+                  m.created_at
+                FROM memberships m
+                JOIN users u ON u.id = m.user_id
+                WHERE m.tenant_id = :tenant_id
+                ORDER BY m.created_at ASC, m.user_id ASC
+            """),
+            {"tenant_id": int(tenant_id)},
+        ).mappings().all()
     items: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -608,7 +660,10 @@ def choose_membership(
 
 def _tenant_exists_by_name(name: str) -> bool:
     with _get_conn() as conn:
-        row = conn.execute("SELECT 1 FROM tenants WHERE name = ? LIMIT 1", (name,)).fetchone()
+        row = conn.execute(
+            text("SELECT 1 FROM tenants WHERE name = :name LIMIT 1"),
+            {"name": name},
+        ).first()
     return bool(row)
 
 
@@ -620,8 +675,8 @@ def _create_tenant(name: str, is_personal: bool) -> int:
     tenant_id = int(db_enterprise.create_tenant(safe_name))
     with _get_conn() as conn:
         conn.execute(
-            "UPDATE tenants SET is_personal = ? WHERE id = ?",
-            (1 if is_personal else 0, tenant_id),
+            text("UPDATE tenants SET is_personal = :is_personal WHERE id = :id"),
+            {"is_personal": bool(is_personal), "id": tenant_id},
         )
     return tenant_id
 
@@ -639,9 +694,7 @@ def create_company_signup(*, company_name: str, admin_email: str, password: str)
         tenant_id = _create_tenant(safe_name, is_personal=False)
     except Exception as exc:
         with _get_conn() as conn:
-            conn.execute("DELETE FROM users WHERE id = ?", (int(user["id"]),))
-        if isinstance(exc, sqlite3.IntegrityError):
-            raise ValueError("company already exists") from exc
+            conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": int(user["id"])})
         raise
     create_membership(tenant_id=tenant_id, user_id=int(user["id"]), role=PRODUCT_ADMIN_ROLE)
     memberships = list_user_memberships(int(user["id"]))
@@ -667,7 +720,7 @@ def create_individual_signup(
         tenant_id = _create_tenant(tenant_name, is_personal=True)
     except Exception:
         with _get_conn() as conn:
-            conn.execute("DELETE FROM users WHERE id = ?", (int(user["id"]),))
+            conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": int(user["id"])})
         raise
     create_membership(tenant_id=tenant_id, user_id=int(user["id"]), role=PRODUCT_ADMIN_ROLE)
     memberships = list_user_memberships(int(user["id"]))
@@ -761,14 +814,21 @@ def create_invite(
 
     normalized_email = _normalize_email(email) if email else None
     token = secrets.token_urlsafe(24)
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=max(1, int(expires_hours)))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=max(1, int(expires_hours)))
     with _get_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO invite_tokens (tenant_id, token, email, role, expires_at, max_uses, uses_count, used_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
-            """,
-            (int(tenant_id), token, normalized_email, role_name, expires_at, max_uses_int),
+            text("""
+                INSERT INTO invite_tokens (tenant_id, token, email, role, expires_at, max_uses, uses_count, used_at)
+                VALUES (:tenant_id, :token, :email, :role, :expires_at, :max_uses, 0, NULL)
+            """),
+            {
+                "tenant_id": int(tenant_id),
+                "token": token,
+                "email": normalized_email,
+                "role": role_name,
+                "expires_at": expires_at,
+                "max_uses": max_uses_int,
+            },
         )
     return {
         "tenant_id": int(tenant_id),
@@ -790,18 +850,22 @@ def signup_with_invite(*, token: str, email: str, password: str) -> Dict[str, An
 
     with _get_conn() as conn:
         invite = conn.execute(
-            """
-            SELECT id, tenant_id, token, email, role, expires_at, used_at, max_uses, COALESCE(uses_count, 0) AS uses_count
-            FROM invite_tokens
-            WHERE token = ?
-            LIMIT 1
-            """,
-            (raw_token,),
-        ).fetchone()
+            text("""
+                SELECT id, tenant_id, token, email, role, expires_at, used_at, max_uses, COALESCE(uses_count, 0) AS uses_count
+                FROM invite_tokens
+                WHERE token = :token
+                LIMIT 1
+            """),
+            {"token": raw_token},
+        ).mappings().first()
     if not invite:
         raise ValueError("invite token is invalid")
     invite_data = dict(invite)
-    if str(invite_data.get("expires_at") or "") <= _utcnow_iso():
+    expires_at = invite_data.get("expires_at")
+    if not expires_at:
+        raise ValueError("invite token is invalid")
+    expires_at_dt = _parse_iso_utc(str(expires_at)) if isinstance(expires_at, str) else expires_at
+    if not expires_at_dt or expires_at_dt <= datetime.now(timezone.utc):
         raise ValueError("invite token is expired")
 
     max_uses_raw = invite_data.get("max_uses")
@@ -830,36 +894,36 @@ def signup_with_invite(*, token: str, email: str, password: str) -> Dict[str, An
     role = str(invite_data["role"])
     create_membership(tenant_id=tenant_id, user_id=int(user["id"]), role=role)
 
-    redeemed_at = _utcnow_iso()
+    redeemed_at = _utcnow_dt()
     with _get_conn() as conn:
         if max_uses is None:
             cur = conn.execute(
-                """
-                UPDATE invite_tokens
-                SET uses_count = COALESCE(uses_count, 0) + 1,
-                    used_at = ?
-                WHERE id = ?
-                  AND max_uses IS NULL
-                  AND used_at IS NULL
-                """,
-                (redeemed_at, int(invite_data["id"])),
+                text("""
+                    UPDATE invite_tokens
+                    SET uses_count = COALESCE(uses_count, 0) + 1,
+                        used_at = :redeemed_at
+                    WHERE id = :id
+                      AND max_uses IS NULL
+                      AND used_at IS NULL
+                """),
+                {"redeemed_at": redeemed_at, "id": int(invite_data["id"])},
             )
             if int(cur.rowcount or 0) == 0:
                 raise ValueError("invite link already used")
         else:
             cur = conn.execute(
-                """
-                UPDATE invite_tokens
-                SET uses_count = COALESCE(uses_count, 0) + 1,
-                    used_at = CASE
-                      WHEN COALESCE(uses_count, 0) + 1 >= max_uses THEN ?
-                      ELSE used_at
-                    END
-                WHERE id = ?
-                  AND max_uses IS NOT NULL
-                  AND COALESCE(uses_count, 0) < max_uses
-                """,
-                (redeemed_at, int(invite_data["id"])),
+                text("""
+                    UPDATE invite_tokens
+                    SET uses_count = COALESCE(uses_count, 0) + 1,
+                        used_at = CASE
+                          WHEN COALESCE(uses_count, 0) + 1 >= max_uses THEN :redeemed_at
+                          ELSE used_at
+                        END
+                    WHERE id = :id
+                      AND max_uses IS NOT NULL
+                      AND COALESCE(uses_count, 0) < max_uses
+                """),
+                {"redeemed_at": redeemed_at, "id": int(invite_data["id"])},
             )
             if int(cur.rowcount or 0) == 0:
                 raise ValueError("invite link max uses reached")

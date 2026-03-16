@@ -107,22 +107,21 @@ app = FastAPI(title="Shadow AI Gateway (MVP + Risk + DB)")
 @app.on_event("startup")
 def migrate():
     """Ensure all SQL migrations are applied on startup."""
-    try:
-        # quick patch for tenants.is_personal
-        with engine.begin() as conn:
-            conn.execute(text("""
-                ALTER TABLE tenants
-                ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT TRUE;
-            """))
-        print("tenants.is_personal ensured")
-    except Exception as e:
-        print(f"Schema patch skipped: {e}")
+    strict_env = (os.getenv("MIGRATIONS_STRICT", "") or "").strip().lower()
+    strict = strict_env in {"1", "true", "yes", "on"} or is_prod()
 
-    # run all migrations
     try:
+        # Ensure ORM-managed schemas exist before applying SQL migrations so the
+        # migration set can't create partial versions of shared tables.
+        enterprise_ensure_schema()
+        init_db()
+
         run_migrations()
+        ensure_product_auth_schema()
     except Exception as e:
         print(f"Migration runner failed: {e}")
+        if strict:
+            raise
 
 # Enterprise middleware (non-breaking defaults)
 app.add_middleware(TenantLimitsMiddleware)

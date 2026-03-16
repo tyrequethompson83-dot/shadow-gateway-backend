@@ -1,29 +1,42 @@
 -- Product authentication and onboarding schema additions.
--- This is equivalent to the additive migration logic in product_auth.ensure_product_auth_schema().
+-- Postgres-safe and idempotent (no table drops).
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Recreate memberships with expanded role support.
-CREATE TABLE IF NOT EXISTS memberships_v2 (
-  id SERIAL PRIMARY KEY,
-  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK(role IN ('admin','auditor','user','tenant_admin','employee')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE(tenant_id, user_id)
-);
+-- Ensure memberships.role constraint allows product roles + platform roles.
+DO $$
+DECLARE
+    c record;
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'memberships'
+    ) THEN
+        -- Drop any existing role CHECK constraints (name may vary by origin).
+        FOR c IN
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'public.memberships'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) ILIKE '%role%'
+              AND pg_get_constraintdef(oid) ILIKE '%IN%'
+        LOOP
+            EXECUTE format('ALTER TABLE memberships DROP CONSTRAINT %I', c.conname);
+        END LOOP;
 
-INSERT INTO memberships_v2 (id, tenant_id, user_id, role, created_at)
-SELECT id, tenant_id, user_id, role, created_at
-FROM memberships;
+        ALTER TABLE memberships
+        ADD CONSTRAINT ck_membership_role
+        CHECK (role IN ('platform_admin','admin','auditor','user','tenant_admin','employee'));
+    END IF;
+END$$;
 
-DROP TABLE memberships;
-ALTER TABLE memberships_v2 RENAME TO memberships;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memberships_tenant_user ON memberships(tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_memberships_tenant_role ON memberships(tenant_id, role);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_name_unique ON tenants(name);
-CREATE INDEX IF NOT EXISTS idx_memberships_tenant_role ON memberships(tenant_id, role);
 
 CREATE TABLE IF NOT EXISTS invite_tokens (
   id SERIAL PRIMARY KEY,
@@ -32,6 +45,8 @@ CREATE TABLE IF NOT EXISTS invite_tokens (
   email TEXT,
   role TEXT NOT NULL CHECK(role IN ('tenant_admin','employee')),
   expires_at TIMESTAMPTZ NOT NULL,
+  max_uses INTEGER,
+  uses_count INTEGER NOT NULL DEFAULT 0,
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

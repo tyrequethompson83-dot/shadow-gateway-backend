@@ -221,7 +221,7 @@ class Tenant(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    is_personal = Column(Boolean, nullable=False, server_default=text("true"))
+    is_personal = Column(Boolean, nullable=False, server_default=text("false"))
 
 
 class User(Base):
