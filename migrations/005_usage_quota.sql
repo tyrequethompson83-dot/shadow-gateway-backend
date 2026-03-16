@@ -21,10 +21,25 @@ CREATE TABLE IF NOT EXISTS tenant_limits (
   FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
+-- If tenant_limits was created earlier by the ORM, it may be missing a server-side default for
+-- daily_token_limit. Ensure the default exists and backfill any NULLs before enforcing NOT NULL.
+ALTER TABLE IF EXISTS tenant_limits
+  ADD COLUMN IF NOT EXISTS daily_token_limit INTEGER;
+
+ALTER TABLE IF EXISTS tenant_limits
+  ALTER COLUMN daily_token_limit SET DEFAULT 200000;
+
+UPDATE tenant_limits
+SET daily_token_limit = 200000
+WHERE daily_token_limit IS NULL;
+
+ALTER TABLE IF EXISTS tenant_limits
+  ALTER COLUMN daily_token_limit SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_usage_tenant_day
 ON tenant_usage_daily(tenant_id, day);
 
 -- Seed default limits for tenant 1 if present.
-INSERT INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, enabled)
-VALUES (1, 2000, 60, true)
+INSERT INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, daily_token_limit, enabled)
+VALUES (1, 2000, 60, 200000, true)
 ON CONFLICT (tenant_id) DO NOTHING;

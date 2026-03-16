@@ -303,7 +303,12 @@ class TenantLimits(Base):
     tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True)
     daily_requests_limit = Column(Integer, nullable=False)
     rpm_limit = Column(Integer, nullable=False)
-    daily_token_limit = Column(Integer, nullable=False, default=DEFAULT_DAILY_TOKEN_LIMIT)
+    daily_token_limit = Column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_DAILY_TOKEN_LIMIT,
+        server_default=text(str(DEFAULT_DAILY_TOKEN_LIMIT)),
+    )
     enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
 
 class TenantProviderConfig(Base):
@@ -714,6 +719,11 @@ def upsert_membership(tenant_id: int, user_id: int, role: str) -> Dict[str, Any]
 # --------------------------------------------------------------------------- #
 
 def _env_api_key(provider: str) -> str:
+    # Tavily is a key-only provider (web search), not an LLM provider.
+    raw = (provider or "").strip().lower()
+    if raw == "tavily":
+        return os.getenv("TAVILY_API_KEY", "").strip()
+
     name = normalize_provider_name(provider)
     if name == "gemini":
         return os.getenv("GEMINI_API_KEY", "").strip()
@@ -723,8 +733,6 @@ def _env_api_key(provider: str) -> str:
         return os.getenv("GROQ_API_KEY", "").strip()
     if name == "anthropic":
         return os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if name == "tavily":
-        return os.getenv("TAVILY_API_KEY", "").strip()
     return ""
 
 
