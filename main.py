@@ -597,7 +597,7 @@ async def call_model(clean_prompt: str, tenant_id: int) -> ProviderCallResult:
 
 
 async def call_model_with_tools(clean_prompt: str, tenant_id: int) -> Tuple[ProviderCallResult, List[Dict[str, Any]]]:
-    tavily_key = get_tenant_tavily_key(int(tenant_id)).get("api_key")
+    tavily_key = (get_tenant_tavily_key(int(tenant_id)) or "").strip() or None
     try:
         provider_client = build_tenant_provider(
             tenant_id=tenant_id,
