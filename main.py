@@ -95,7 +95,11 @@ from security_utils import redact_secrets, validate_runtime_security
 from tenant_policy import evaluate_tenant_policy
 from tenant_llm import build_tenant_provider, provider_health_snapshot
 from tools.tool_router import execute_tool_call
-from tools.web_search import WebSearchError, WEB_SEARCH_TOOL
+from tools.web_search import (
+    WebSearchError,
+    WEB_SEARCH_TOOL_OPENAI,
+    WEB_SEARCH_TOOL_ANTHROPIC,
+)
 
 from fastapi import FastAPI
 from sqlalchemy import text
@@ -607,8 +611,6 @@ async def call_model_with_tools(clean_prompt: str, tenant_id: int) -> Tuple[Prov
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    tools = [WEB_SEARCH_TOOL]
-
     if isinstance(provider_client, GeminiProvider):
         try:
             _log_chat_event(
@@ -623,9 +625,11 @@ async def call_model_with_tools(clean_prompt: str, tenant_id: int) -> Tuple[Prov
         return result, []
 
     if isinstance(provider_client, OpenAIProvider):
+        tools = [WEB_SEARCH_TOOL_OPENAI]
         return await _execute_openai_tool_flow(provider_client, clean_prompt, tools, tavily_key)
 
     if isinstance(provider_client, AnthropicProvider):
+        tools = [WEB_SEARCH_TOOL_ANTHROPIC]
         return await _execute_anthropic_tool_flow(provider_client, clean_prompt, tools, tavily_key)
 
     result = await provider_client.generate_text(clean_prompt)

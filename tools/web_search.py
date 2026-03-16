@@ -9,29 +9,42 @@ LOGGER = logging.getLogger("shadow.tools.web_search")
 TAVILY_API_URL = "https://api.tavily.com/search"
 
 
-# Tool schema compatible with OpenAI/Anthropic tool-calling payloads
-WEB_SEARCH_TOOL: Dict[str, Any] = {
-    "type": "function",
-    "name": "web_search",
-    "description": "Search the web for up-to-date information and return relevant results.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The search query to run. Use natural language, include entities and key facts.",
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of results to return (1-10).",
-                "minimum": 1,
-                "maximum": 10,
-                "default": 5,
-            },
+_WEB_SEARCH_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "The search query to run. Use natural language, include entities and key facts.",
         },
-        "required": ["query"],
+        "max_results": {
+            "type": "integer",
+            "description": "Maximum number of results to return (1-10).",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 5,
+        },
+    },
+    "required": ["query"],
+}
+
+# Provider-specific tool schemas (OpenAI != Anthropic).
+WEB_SEARCH_TOOL_OPENAI: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web for up-to-date information and return relevant results.",
+        "parameters": _WEB_SEARCH_INPUT_SCHEMA,
     },
 }
+
+WEB_SEARCH_TOOL_ANTHROPIC: Dict[str, Any] = {
+    "name": "web_search",
+    "description": "Search the web for up-to-date information and return relevant results.",
+    "input_schema": _WEB_SEARCH_INPUT_SCHEMA,
+}
+
+# Default schema used for introspection/listing.
+WEB_SEARCH_TOOL: Dict[str, Any] = WEB_SEARCH_TOOL_OPENAI
 
 
 class WebSearchError(Exception):
