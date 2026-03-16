@@ -1,7 +1,7 @@
 -- One-time migration for tenant-scoped request data.
 -- If this file is executed on a DB where tenant_id already exists, skip this migration.
 
-ALTER TABLE requests ADD COLUMN tenant_id INTEGER;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS tenant_id INTEGER;
 
 UPDATE requests
 SET tenant_id = 1
