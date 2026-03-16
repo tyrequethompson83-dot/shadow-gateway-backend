@@ -24,5 +24,5 @@ ON tenant_usage_daily(tenant_id, day);
 
 -- Seed default limits for tenant 1 if present.
 INSERT INTO tenant_limits (tenant_id, daily_requests_limit, rpm_limit, enabled)
-VALUES (1, 2000, 60, 1)
+VALUES (1, 2000, 60, true)
 ON CONFLICT (tenant_id) DO NOTHING;
