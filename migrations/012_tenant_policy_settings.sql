@@ -8,10 +8,10 @@ CREATE TABLE IF NOT EXISTS tenant_policy_settings (
   health_action TEXT NOT NULL DEFAULT 'redact',
   ip_action TEXT NOT NULL DEFAULT 'redact',
   block_threshold TEXT NOT NULL DEFAULT 'critical',
-  store_original_prompt INTEGER NOT NULL DEFAULT 1,
-  show_sanitized_prompt_admin INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  store_original_prompt BOOLEAN NOT NULL DEFAULT TRUE,
+  show_sanitized_prompt_admin BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
@@ -36,10 +36,10 @@ SELECT
   'redact',
   'redact',
   'critical',
-  1,
-  1,
-  datetime('now'),
-  datetime('now')
+  TRUE,
+  TRUE,
+  NOW(),
+  NOW()
 FROM tenants t
 LEFT JOIN tenant_policy_settings s ON s.tenant_id = t.id
 WHERE s.tenant_id IS NULL;

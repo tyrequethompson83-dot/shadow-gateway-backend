@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS tenant_usage_daily (
   token_count INTEGER NOT NULL DEFAULT 0,
   blocked_count INTEGER NOT NULL DEFAULT 0,
   risk_sum INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (tenant_id, day),
   FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );

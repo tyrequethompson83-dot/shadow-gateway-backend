@@ -1,7 +1,7 @@
 -- Add multi-use support for invite tokens while preserving single-use behavior.
 
-ALTER TABLE invite_tokens ADD COLUMN max_uses INTEGER;
-ALTER TABLE invite_tokens ADD COLUMN uses_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS max_uses INTEGER;
+ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS uses_count INTEGER NOT NULL DEFAULT 0;
 
 -- Backfill legacy single-use invites that were already consumed.
 UPDATE invite_tokens
