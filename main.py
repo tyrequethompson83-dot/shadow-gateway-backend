@@ -71,6 +71,7 @@ from product_auth import (
     create_company_signup,
     create_individual_signup,
     create_invite,
+    delete_user_account,
     ensure_product_auth_schema,
     get_membership_role,
     list_tenant_members,
@@ -1670,6 +1671,34 @@ def me(ctx: RequestContext = Depends(require_tenant_member)):
         is_personal=current_is_personal,
         memberships=memberships,
     )
+
+
+@app.delete("/me")
+def me_delete(request: Request, ctx: RequestContext = Depends(require_tenant_member)):
+    try:
+        result = delete_user_account(user_id=int(ctx.user_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        enterprise_write_audit_log(
+            tenant_id=int(ctx.tenant_id),
+            user_id=int(ctx.user_id) if ctx.user_id is not None else None,
+            action="user.deleted",
+            target_type="user",
+            target_id=str(ctx.user_id),
+            metadata={"result": result},
+        )
+    except Exception:
+        pass
+
+    _log_auth_event(
+        request,
+        "auth.account.deleted",
+        user_id=int(ctx.user_id) if ctx.user_id is not None else None,
+        tenant_id=int(ctx.tenant_id),
+    )
+    return {"ok": True}
 
 
 @app.post("/tenant/admin/invite")

@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 214 33% 96%;
+  --foreground: 222 44% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 42% 15%;
+  --border: 217 28% 86%;
+  --muted: 215 24% 95%;
+  --muted-foreground: 218 16% 41%;
+  --primary: 193 90% 34%;
+  --primary-foreground: 0 0% 100%;
+  --accent: 197 83% 94%;
+  --accent-foreground: 196 77% 23%;
+  --danger: 352 83% 56%;
+  --ring: 193 90% 34%;
+}
+
+* {
+  @apply border-border;
+}
+
+html,
+body {
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  color: hsl(var(--foreground));
+  background:
+    radial-gradient(circle at 84% -8%, rgba(56, 189, 248, 0.2) 0%, rgba(56, 189, 248, 0) 40%),
+    radial-gradient(circle at -6% 22%, rgba(125, 211, 252, 0.2) 0%, rgba(125, 211, 252, 0) 42%),
+    linear-gradient(180deg, #f6f8fc 0%, #edf2f9 100%);
+  font-family: var(--font-body), "Segoe UI", sans-serif;
+  letter-spacing: -0.01em;
+  text-rendering: optimizeLegibility;
+}
+
+.font-heading {
+  font-family: var(--font-heading), "Trebuchet MS", sans-serif;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5 {
+  letter-spacing: -0.02em;
+}
+
+p {
+  line-height: 1.55;
+}
+
+@layer components {
+  .stagger-item {
+    opacity: 1;
+    animation: fade-up 420ms ease-out both;
+  }
+
+  .stagger-item:nth-child(1) {
+    animation-delay: 80ms;
+  }
+
+  .stagger-item:nth-child(2) {
+    animation-delay: 120ms;
+  }
+
+  .stagger-item:nth-child(3) {
+    animation-delay: 160ms;
+  }
+
+  .stagger-item:nth-child(4) {
+    animation-delay: 200ms;
+  }
+
+  .app-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(100, 116, 139, 0.4) transparent;
+  }
+
+  .app-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .app-scroll::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background: rgba(100, 116, 139, 0.32);
+  }
+
+  .field-label {
+    @apply mb-1.5 block text-xs font-semibold uppercase tracking-[0.08em] text-slate-500;
+  }
+
+  .select-input {
+    @apply h-10 w-full rounded-xl border border-slate-300/95 bg-white px-3 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20;
+  }
+
+  .surface-muted {
+    @apply rounded-2xl border border-slate-200/80 bg-slate-50/80;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stagger-item {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+}

@@ -800,6 +800,87 @@ def get_user_profile(user_id: int) -> Dict[str, Any]:
     }
 
 
+def delete_user_account(*, user_id: int) -> Dict[str, Any]:
+    ensure_product_auth_schema()
+    target_user_id = int(user_id)
+    user = get_user_by_id(target_user_id)
+    if not user:
+        raise ValueError("user not found")
+
+    memberships = list_user_memberships(target_user_id)
+
+    # Prevent orphaning a company tenant by deleting its last tenant_admin.
+    for membership in memberships:
+        tenant_id = int(membership.get("tenant_id") or 0)
+        role = _normalize_role_name(str(membership.get("role") or ""))
+        is_personal = bool(membership.get("is_personal"))
+        if not tenant_id or role != PRODUCT_ADMIN_ROLE or is_personal:
+            continue
+
+        with _get_conn() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT COUNT(1) AS c
+                    FROM memberships
+                    WHERE tenant_id = :tenant_id
+                      AND role = :role
+                      AND user_id != :user_id
+                """),
+                {"tenant_id": tenant_id, "role": PRODUCT_ADMIN_ROLE, "user_id": target_user_id},
+            ).mappings().first()
+
+        remaining_admins = int((row or {}).get("c") or 0)
+        if remaining_admins == 0:
+            tenant_name = str(membership.get("tenant_name") or f"Tenant {tenant_id}")
+            raise ValueError(
+                f"cannot delete account: you are the last tenant_admin for {tenant_name}. "
+                "Assign another tenant_admin first."
+            )
+
+    # Clean up personal tenants that would otherwise become orphaned.
+    personal_tenants_to_delete: List[int] = []
+    for membership in memberships:
+        if not bool(membership.get("is_personal")):
+            continue
+        tenant_id = int(membership.get("tenant_id") or 0)
+        if not tenant_id:
+            continue
+
+        with _get_conn() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT COUNT(1) AS c
+                    FROM memberships
+                    WHERE tenant_id = :tenant_id
+                      AND user_id != :user_id
+                """),
+                {"tenant_id": tenant_id, "user_id": target_user_id},
+            ).mappings().first()
+
+        other_members = int((row or {}).get("c") or 0)
+        if other_members == 0:
+            personal_tenants_to_delete.append(tenant_id)
+
+    with _get_conn() as conn:
+        conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": target_user_id})
+        # Best-effort cleanup: remove personal tenants that no longer have members.
+        for tenant_id in personal_tenants_to_delete:
+            conn.execute(
+                text("""
+                    DELETE FROM tenants
+                    WHERE id = :id
+                      AND COALESCE(is_personal, FALSE) = TRUE
+                """),
+                {"id": int(tenant_id)},
+            )
+
+    return {
+        "ok": True,
+        "user_id": target_user_id,
+        "deleted_personal_tenant_ids": personal_tenants_to_delete,
+    }
+
+
 def create_invite(
     *,
     tenant_id: int,
